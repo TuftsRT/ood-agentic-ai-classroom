@@ -1,0 +1,283 @@
+# <% require "json" %>
+# <% load File.join(__dir__, "lib/class_tiers.rb") %>
+# <% load File.join(__dir__, "lib/course_storage.rb") %>
+# <% available_courses = CourseStorage.discover %>
+# <% active_courses = available_courses.select { |c| CourseStorage.active_session?(c.group) } %>
+# <% available_student_courses = CourseStorage.discover_as_student %>
+# <% active_student_courses = available_student_courses.select { |c| CourseStorage.active_session?(c.group) } %>
+---
+cluster: "pax"
+
+form:
+  - "role_select"
+  - "course_select"
+  - "course_group"
+  - "course_name"
+  - "course_select_student"
+  - "class_size"
+  - "roster"
+  - "num_hours"
+  - "bc_email_on_started"
+  - "guardrail_coursework"
+  - "guardrail_sensitive"
+  - "guardrails"
+  - "advanced_options"
+  - "reference_docs_dir"
+  - "sandbox_llm"
+  - "prompt_caching"
+
+attributes:
+  role_select:
+    widget: "select"
+    label: "I am a..."
+    cacheable: false
+    value: "faculty"
+    options:
+      - - "Faculty / TA -- start a class session"
+        - "faculty"
+        - data-hide-course-select-student: true
+      - - "Student -- connect to a session my instructor already started"
+        - "student"
+        - data-hide-course-select: true
+          data-hide-course-name: true
+          data-hide-class-size: true
+          data-hide-roster: true
+          data-hide-bc-email-on-started: true
+          data-hide-guardrail-coursework: true
+          data-hide-guardrail-sensitive: true
+          data-hide-guardrails: true
+          data-hide-advanced-options: true
+          data-hide-reference-docs-dir: true
+          data-hide-sandbox-llm: true
+          data-hide-prompt-caching: true
+    help: |
+      Student mode submits a tiny, GPU-free lookup job -- it checks whether
+      your instructor's session is running and shows you the connection
+      link and your own API key, it doesn't start a model session itself.
+
+  course_select_student:
+    widget: "select"
+    label: "Course"
+    cacheable: false
+    # Unlike course_select above, there's no hidden-field/JS side effect
+    # riding on this dropdown's own change event to worry about leaving
+    # unset -- it's a plain select the student picks directly, nothing else
+    # reacts to it. So defaulting to the first real course (when one is
+    # auto-detected) rather than "Other" is safe here, and avoids a real
+    # failure mode seen directly: submitting without ever touching this
+    # dropdown left it on "Other," which correctly but unhelpfully reports
+    # "couldn't confirm you belong to this course" for a student who very
+    # much did mean to pick their real course.
+    value: "<%= available_student_courses.first&.dir_name || CourseStorage::OTHER_VALUE %>"
+    options: <%= JSON.generate(CourseStorage.select_options_student(available_student_courses)) %>
+    help: |
+      <% if available_student_courses.empty? %>
+      No courses were auto-detected for your account (you need to be a
+      member of a course's storage group for it to show up here) -- ask
+      your instructor for the connection link and key directly instead.
+      <% else %>
+      Pick your course to check whether your instructor has started a
+      session.
+      <% if active_student_courses.any? %>
+
+      Currently running: <%= active_student_courses.map(&:code).join(', ') %>.
+      <% end %>
+      <% end %>
+
+  course_select:
+    widget: "select"
+    label: "Course"
+    cacheable: false
+    # Defaults to "Other" rather than whichever course happens to be listed
+    # first -- it's undocumented whether the data-set-*/data-hide-* directives
+    # below even apply on initial page load vs. only on a later change event,
+    # so starting on a real course could silently leave course_group/
+    # course_name unset despite the dropdown showing a course. Defaulting to
+    # "Other" keeps the initial state identical to the old plain-manual form
+    # until the instructor actively picks something, which is guaranteed to
+    # fire a change event.
+    value: "<%= CourseStorage::OTHER_VALUE %>"
+    options: <%= JSON.generate(CourseStorage.select_options(available_courses)) %>
+    help: |
+      <% if available_courses.empty? %>
+      No courses were auto-detected for your account (you need to be a
+      member of a course storage group's "...admin" group for it to show up
+      here) -- pick "Other" below and fill in the Course / Session Label and
+      Student Roster yourself, same as before.
+      <% else %>
+      Auto-detected from the class storage you administer. Picking a course
+      fills in the label below and, for reference documents and the student
+      roster, uses that course's storage/group automatically. Pick "Other"
+      to fill everything in by hand instead.
+      <% if active_courses.any? %>
+
+      Already running a session right now: <%= active_courses.map(&:code).join(', ') %>
+      -- launching again starts a second, separate session for that course
+      rather than replacing it.
+      <% end %>
+      <% end %>
+
+  course_group:
+    widget: "hidden_field"
+    cacheable: false
+    required: false
+    value: ""
+
+  course_name:
+    widget: "text_field"
+    label: "Course / Session Label"
+    cacheable: false
+    required: false
+    # Cosmetic field only -- already rendered through view.html.erb's `esc`
+    # HTML-escaping and written into the job script via a quoted heredoc
+    # (see before.sh.erb), so this isn't a security boundary. Just a sane
+    # upper bound on a single-line label (no embedded newlines).
+    pattern: '^[^\r\n]{0,120}$'
+    help: |
+      Shown on the connection page so you can tell sessions apart. Purely
+      cosmetic -- picking a course above fills in its bare code (e.g.
+      `EM0293`); feel free to edit it to something more specific, like
+      `EM0293 - Week 4`.
+
+  class_size:
+    widget: "select"
+    label: "Class Size"
+    cacheable: false
+    help: |
+      Picks the GPU, the number of concurrent student slots, and the model
+      together -- we have curated the best model for you for each tier.
+      Each tier has already been verified to support tool/function calling.
+      Larger tiers use a larger GPU so the whole class is served from the
+      same model endpoint.
+    value: "small"
+    options: <%= JSON.generate(ClassTiers.select_options) %>
+
+  roster:
+    widget: "text_area"
+    label: "Student Roster"
+    cacheable: false
+    required: false
+    rows: 10
+    help: |
+      Hidden when you pick a course above -- the roster is pulled
+      automatically from that course's storage group instead. Only used when
+      "Other" is selected: paste one student identifier per line (username,
+      email, or name), up to the class-size limit above. Each line gets its
+      own individual API key, shown in a table on the connection page after the
+      job starts. Leave this blank to generate anonymous "Slot 1, Slot 2,
+      ..." keys instead.
+
+  num_hours:
+    widget: "number_field"
+    label: "Session Length (hours)"
+    cacheable: false
+    required: true
+    help: |
+      Upper limit for the class session in hours. The job is terminated
+      once this elapses. Higher values might delay job start.
+    value: 3
+    min: 1
+    max: 8
+    step: 1
+
+  bc_email_on_started:
+    widget: "check_box"
+    label: "Email me when the session starts"
+    cacheable: false
+    value: "0"
+    help: |
+      Sends you an email as soon as the Slurm job begins running. That's not
+      quite the same as "ready" -- the model can take an extra minute or two
+      to finish loading after the job starts, so the connection page's own
+      status indicator is still the real signal for when to share the link
+      with students. Off by default.
+
+  guardrail_coursework:
+    widget: "check_box"
+    label: "Guardrail: Coursework"
+    cacheable: false
+    value: "1"
+    help: |
+      Tells the model not to discuss or help with this course's homework,
+      problem sets, or exam content. On by default.
+
+  guardrail_sensitive:
+    widget: "check_box"
+    label: "Guardrail: Sensitive topics"
+    cacheable: false
+    value: "1"
+    help: |
+      Tells the model not to engage with sensitive topics, including
+      cybersecurity work (e.g. writing exploits/malware or attacking
+      systems). On by default -- turn this off if your course is itself
+      about security/offensive topics, or it'll block your own coursework.
+
+  guardrails:
+    widget: "text_area"
+    label: "Other guardrails (optional)"
+    cacheable: false
+    required: false
+    rows: 4
+    help: |
+      Anything else you don't want students using this tool for, beyond the
+      two checkboxes above (e.g. "don't give full answers to Problem Set
+      3"). Added to the model's system prompt on every request along with
+      whichever checkboxes above are on. Leave blank for none.
+
+  reference_docs_dir:
+    widget: "path_selector"
+    label: "Reference documents (optional)"
+    cacheable: false
+    required: false
+    directory: "<%= CurrentUser.home %>"
+    show_files: false
+    data-target-file-type: "dirs"
+    help: |
+      Point this at a folder of files to pre-load into the chatbot's
+      knowledge base for the whole class. Upload them to your storage
+      first via the Files tab at the start of this screen, then browse to
+      the folder here by clicking Select Path below. Indexed once when the
+      session starts, using RAG.
+
+  advanced_options:
+    widget: "check_box"
+    label: "Advanced Options"
+    cacheable: false
+    value: "0"
+    help: |
+      Reference documents, sandboxing (recommended, on by default), and
+      prompt caching for long-running sessions live here. Opens
+      automatically when you pick a course above, so you can see the
+      reference-documents folder it filled in. Collapsing this section
+      again doesn't reset any of the three fields -- sandboxing stays on by
+      default whether or not you've ever opened it.
+    data:
+      hide-reference-docs-dir-when-un-checked: true
+      hide-sandbox-llm-when-un-checked: true
+      hide-prompt-caching-when-un-checked: true
+
+  sandbox_llm:
+    widget: "check_box"
+    label: "Sandbox the LLM environment (Recommended)"
+    cacheable: false
+    value: "1"
+    help: |
+      Runs the model server (not the connection proxy students actually talk
+      to -- see SECURITY-OVERVIEW.md) inside a locked-down container: model
+      files are mounted read-only, your home directory is shadowed with an
+      empty, private space (unreachable from inside it), and the session
+      folder itself and the rest of the cluster filesystem are both shared
+      back read-only, so nothing on the filesystem can be modified from
+      inside. This does not isolate the network -- it's filesystem/process
+      containment, not a firewall. Only turn this off if an exercise
+      genuinely needs the server to reach a dataset or service outside its
+      own session folder.
+
+  prompt_caching:
+    widget: "check_box"
+    label: "Enable prompt caching"
+    cacheable: false
+    value: "0"
+    help: |
+      Reuses cached KV state from a matching prompt prefix instead of
+      reprocessing it on every request -- speeds up multi-turn conversations.

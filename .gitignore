@@ -1,0 +1,14 @@
+# The embedding model is fetched (and hash-pinned) by
+# download-embedding-model.sh, not committed -- see README.md and
+# SECURITY-OVERVIEW.md. Keep the directory and its pin file, drop the
+# binary itself.
+/models/embedding/**/*.gguf
+
+# Per-site overrides (see lib/site_config.rb, config/site.yml.example) --
+# local to whichever site deploys this app, never the shared repo. An
+# absent config/site.yml is the Tufts default.
+/config/site.yml
+
+.DS_Store
+*.swp
+*~

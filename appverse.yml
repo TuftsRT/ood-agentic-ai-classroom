@@ -1,0 +1,25 @@
+name: "Agentic AI Classroom Sandbox"
+description: >
+  Launches llama.cpp's llama-server as one shared, tool-calling-capable LLM
+  session for an entire class, with web search, academic literature search,
+  and an optional pre-loaded reference-document (RAG) knowledge base. One GPU
+  serves the whole class via concurrent inference slots; every student gets
+  their own API key to the same running model instead of their own GPU job.
+software: "llama.cpp"      # TODO: confirmed against the live Appverse catalog
+                            # (2026-11-16) that there is no "llama.cpp" Software
+                            # entry yet -- ask the reviewer to create one, or
+                            # correct this value, before submitting.
+app_type: "batch-connect-basic"
+implementation_tags: ["apptainer", "classroom", "gpu-enabled", "multitenant"]
+# "slurm" isn't in the published implementation-tag vocabulary (schedulers
+# aren't part of it -- the 14 published terms are docker, containerized,
+# apptainer, classroom, gpu-enabled, modules, source install, passenger,
+# batch connect, api, mcp, kubernetes, multitenant, EESSI). Replaced with
+# three terms that are genuinely true of this app instead: it's explicitly
+# classroom-oriented, requires a GPU, and serves many students concurrently
+# off one shared session (multitenant).
+maintainer:
+  name: "Tufts University Research Technology"
+  support_url: "mailto:tts-research@tufts.edu"   # same address rag-sandbox,
+                                                  # rustgis-agentic and
+                                                  # ood-deid already use

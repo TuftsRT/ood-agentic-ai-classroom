@@ -1,0 +1,989 @@
+#!/bin/bash
+# `__dir__` is unreliable here, same as before.sh.erb -- see that file's
+# header comment. `session.app.root` works in this file too (confirmed:
+# render_erb_files uses the same binding for every template/*.sh.erb file).
+# <% app_root = session.app.root %>
+# <% load File.join(app_root, "lib/site_config.rb") %>
+set -euo pipefail
+
+if [ "${role:-faculty}" = "student" ]; then
+    # Lookup-only job: no GPU, no containers, no model. Periodically
+    # re-checks squeue for the instructor's job (keyed by the same job-name
+    # convention both roles use -- see lib/course_storage.rb's
+    # job_name_for/the Faculty branch's `scontrol update ... Comment=`
+    # below) and the shared keys.csv the Faculty branch publishes into the
+    # course's own storage directory, then writes whatever it finds to
+    # $status_path, a conn_param (see submit.yml.erb) view.html.erb re-reads
+    # fresh on every page load/poll -- same pattern this app already uses
+    # for roster.csv/guardrails.txt on the Faculty side.
+    my_username="$(id -un)"
+    job_name="llm-classroom-sandbox/${course_group}"
+    shared_dir="${storage_root}/${course_group}/.llm-classroom-sandbox"
+    shared_keys_file="$shared_dir/keys.csv"
+    shared_session_file="$shared_dir/session.json"
+
+    json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n'; }
+
+    refresh_status() {
+        if [ -z "$course_group" ]; then
+            printf '%s\n' '{"checked": true, "found": false, "error": "no_course"}' > "$status_path"
+            return
+        fi
+
+        # %k is squeue's Comment field -- the Faculty branch stuffs
+        # "host=...;port=..." in there once its own guardrails_proxy is up
+        # (see below), specifically so a student's own job never has to read
+        # anything under the instructor's permission-restricted OOD session
+        # directory to find it. This cluster's squeue cross-user visibility
+        # (whether a student can even see a job submitted by someone else)
+        # could not be verified from an unprivileged dev shell when this was
+        # written -- an empty/missing result here falls through to the
+        # shared_session_file mirror below rather than being treated as
+        # fatal, so a restrictive `PrivateData` setting degrades to a slower
+        # discovery path instead of silently never working.
+        #
+        # Every command substitution below is guarded with `|| true` --
+        # `squeue` unreachable, no Comment match yet (scontrol update hasn't
+        # landed), or shared_keys_file briefly unreadable are all routine,
+        # expected states while polling, not script-ending errors. Without
+        # this, `set -e` + `set -o pipefail` would kill this whole loop
+        # outright the first time any one of them comes back empty/nonzero
+        # (confirmed directly: `x="$(false)"` alone aborts a `set -e` shell).
+        host=""
+        port=""
+        # Submitting a job named "$job_name" and setting its own Comment
+        # field is not a privileged action -- any course member could do
+        # both, so a squeue match alone doesn't prove it's the instructor's
+        # job. Only trust a match whose owner (%u) is currently an admin of
+        # this course -- the same "${course_group}admin" membership
+        # before.sh.erb already re-validated before honoring course_group
+        # at all -- so a classmate can't spoof another student's connection
+        # page by racing a look-alike job into squeue first. `while read`
+        # rather than `head -n1` so a spoofed job sorted ahead of the real
+        # one doesn't win just by matching first.
+        while IFS='|' read -r _jobid _state owner comment; do
+            [ -z "$owner" ] && continue
+            if ! id -nG "$owner" 2>/dev/null | tr ' ' '\n' | grep -qx "${course_group}admin"; then
+                continue
+            fi
+            host="$(printf '%s' "$comment" | grep -o 'host=[^;]*' | cut -d= -f2- || true)"
+            port="$(printf '%s' "$comment" | grep -o 'port=[^;]*' | cut -d= -f2- || true)"
+            [ -n "$host" ] && echo "Found via squeue (job comment, owner $owner verified admin): host=$host port=$port" >&2
+            break
+        done < <(timeout 5s squeue --noheader --name="$job_name" --format='%i|%T|%u|%k' 2>/dev/null || true)
+
+        # Fallback mirror: squeue came back empty/unreachable, or found the
+        # job but its Comment hasn't been set yet (a few-second window right
+        # after the job starts, before script.sh.erb's own `scontrol update`
+        # runs) -- the same host/port, published into the course's own
+        # storage directory by the Faculty branch, in a fixed, hand-rolled
+        # one-line JSON format this script itself controls (see
+        # before.sh.erb/script.sh.erb), so plain grep/cut can pull it apart
+        # without needing a JSON library on the bare compute node.
+        #
+        # Logged either way (to this job's own output.log, viewable via the
+        # OOD dashboard's job list even though the student view doesn't link
+        # it directly) specifically so this can be verified end-to-end: this
+        # app doesn't know whether this cluster's Slurm `PrivateData` setting
+        # even allows a student to see another user's job via squeue at all
+        # (see SECURITY-OVERVIEW.md) -- which path actually fired is the way
+        # to tell.
+        if [ -z "$host" ] && [ -f "$shared_session_file" ]; then
+            host="$(grep -o '"host": "[^"]*"' "$shared_session_file" 2>/dev/null | cut -d'"' -f4 || true)"
+            port="$(grep -o '"port": [0-9]*' "$shared_session_file" 2>/dev/null | grep -o '[0-9]*$' || true)"
+            [ -n "$host" ] && echo "Found via shared_session_file (squeue fallback): host=$host port=$port" >&2
+        fi
+
+        if [ -z "$host" ] || [ -z "$port" ]; then
+            printf '%s\n' '{"checked": true, "found": false}' > "$status_path"
+            return
+        fi
+
+        api_key=""
+        if [ -f "$shared_keys_file" ]; then
+            # Group-readable, not world-readable or ACL-scoped to just this
+            # student -- see the shared_keys_file comment in before.sh.erb
+            # for why (no ACL support on this cluster's NFS course storage).
+            api_key="$(awk -F, -v u="$my_username" '$1==u {print $2; exit}' "$shared_keys_file" 2>/dev/null || true)"
+        fi
+
+        printf '{"checked": true, "found": true, "host": "%s", "port": "%s", "api_key": "%s"}\n' \
+            "$(json_escape "$host")" "$(json_escape "$port")" "$(json_escape "$api_key")" \
+            > "$status_path"
+    }
+
+    # Nothing else for this job to do (no shared-storage artifacts of its
+    # own to clean up, unlike the Faculty branch below) -- refresh
+    # immediately, then every 15s for the rest of its (short, GPU-free) wall
+    # time.
+    while true; do
+        refresh_status
+        sleep 15
+    done
+    exit 0
+fi
+
+CONTAINER_DIR="<%= SiteConfig.container_dir %>"
+GPU_CONTAINER="$CONTAINER_DIR/llama-server-gpu.sif"
+SEARXNG_SIF="<%= SiteConfig.searxng_image %>"
+
+# Fail loudly and early rather than letting apptainer emit a cryptic
+# "image not found" error after everything else (ports, SearXNG config,
+# bwrap setup) has already been set up -- a missing/moved container image
+# is an infra problem the student/instructor can't fix themselves, so the
+# output log should say so plainly.
+if [ ! -f "$GPU_CONTAINER" ]; then
+    echo "ERROR: GPU container image not found at $GPU_CONTAINER -- contact your system administrator." >&2
+    exit 1
+fi
+if [ ! -f "$model_file" ]; then
+    echo "ERROR: model file not found at $model_file for tier '$tier_key' -- contact your system administrator." >&2
+    exit 1
+fi
+
+# "Sub-pieces" of the GPU: this cluster has no real NVIDIA MIG, so instead of
+# giving each student their own GPU job, one GPU runs one llama-server with
+# `--parallel $num_slots` concurrent inference slots sharing a single model
+# -- each student's API key lands on the same server and gets served from
+# whichever slot is free.
+TOTAL_CTX=$(( ctx_per_slot * num_slots ))
+NUM_CPU="${SLURM_CPUS_PER_TASK:-$(nproc)}"
+MODEL_DIR="$(dirname "$model_file")"
+
+# Reference-documents embedding server (RAG feature, see reference_docs_dir
+# in before.sh.erb) is always CPU-only and needs only a couple of threads
+# for a ~139MB model -- carved out of the generation server's own thread
+# budget rather than added on top, so a shared node's actual core count is
+# never oversubscribed. Only reserved when the feature is actually enabled.
+RAG_EMBED_THREADS=2
+if [ -n "$reference_docs_dir" ] && [ "$NUM_CPU" -gt "$RAG_EMBED_THREADS" ]; then
+    GEN_NUM_CPU=$((NUM_CPU - RAG_EMBED_THREADS))
+else
+    GEN_NUM_CPU="$NUM_CPU"
+fi
+
+# Keep this under $PWD (the job's own working directory), not /tmp -- once
+# bubblewrap shadows /tmp below, anything created under the real /tmp before
+# that point becomes invisible inside the sandbox.
+export XDG_RUNTIME_DIR="$PWD/.xdg-runtime"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+my_find_port() {
+    local min_port=49152
+    local max_port=65535
+    for p in $(shuf -i ${min_port}-${max_port}); do
+        if ! nc -z 127.0.0.1 "$p" 2>/dev/null; then
+            echo "$p"
+            return 0
+        fi
+    done
+    echo "ERROR: no free port found in ${min_port}-${max_port}" >&2
+    return 1
+}
+
+# --- Web search: a loopback-only SearXNG instance feeds llama-server's
+# web_search MCP tool (mcp_tools.py, spawned by llama-server itself --
+# see below). Same container and settings.yml pattern already proven to work
+# on this cluster by the ollama_webui app. Unlike the LLM itself, SearXNG
+# needs real outbound internet access to do its job; that's independent of
+# the "Sandbox the LLM environment" toggle, which only ever covered the
+# model's own filesystem/process containment, never network (see
+# SECURITY-OVERVIEW.md).
+SEARXNG_DIR="$PWD/.searxng"
+SEARXNG_SETTINGS="$SEARXNG_DIR/settings.yml"
+mkdir -p "$SEARXNG_DIR"
+
+SEARXNG_CACHE_DIR="$(mktemp -d "${TMPDIR:-$PWD}/searxng-cache.XXXXXX")"
+chmod 700 "$SEARXNG_CACHE_DIR"
+
+if [ ! -f "$SEARXNG_SETTINGS" ]; then
+    SEARXNG_SECRET_KEY="$(openssl rand -hex 32)"
+    # google/bing removed entirely, not just rate-limited: testing showed
+    # their SearXNG engines returning actively misleading garbage (Fox
+    # News/CNN homepages, an unrelated school district page) rather than
+    # real results or honest failures -- almost certainly Google/Bing
+    # serving a CAPTCHA/interstitial block page to this datacenter IP, which
+    # SearXNG's HTML scraper then parses as if it contained real results.
+    # Worse than no search at all for an educational tool.
+    #
+    # In their place: API-based engines (not HTML scraping, so no block
+    # pages to misparse) that also fit this app's actual audience better
+    # than general news ever would -- arxiv for papers, github/stackoverflow/
+    # pypi for code and libraries, wikipedia for general reference. This
+    # trades away general "current events" search (which datacenter-IP
+    # scraping couldn't deliver reliably anyway) for results that are either
+    # genuinely relevant or honestly empty, never misleading.
+    #
+    # Reminder for future engine changes: "keep_only" only FILTERS the list
+    # by name, it does NOT clear an engine's own "disabled" flag (google/bing
+    # both ship disabled by default -- the bug that caused a prior "only
+    # wikipedia actually works" failure). Any engine added here needs an
+    # explicit "disabled: false" override too, not just a keep_only entry.
+    cat > "$SEARXNG_SETTINGS" <<EOF
+use_default_settings:
+  engines:
+    keep_only:
+      - arxiv
+      - github
+      - stackoverflow
+      - pypi
+      - wikipedia
+
+engines:
+  - name: arxiv
+    disabled: false
+  - name: github
+    disabled: false
+  - name: stackoverflow
+    disabled: false
+  - name: pypi
+    disabled: false
+  - name: wikipedia
+    disabled: false
+
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  secret_key: "${SEARXNG_SECRET_KEY}"
+
+search:
+  formats:
+    - html
+    - json
+EOF
+    chmod 600 "$SEARXNG_SETTINGS"
+fi
+
+SEARXNG_PORT="$(my_find_port)"
+export SEARXNG_PORT
+
+module purge
+module load apptainer
+if ! command -v apptainer >/dev/null 2>&1; then
+    echo "ERROR: apptainer module failed to load (module load apptainer did not put 'apptainer' on PATH) -- contact your system administrator." >&2
+    exit 1
+fi
+
+apptainer exec \
+    --bind "$SEARXNG_DIR:/etc/searxng:rw" \
+    --bind "$SEARXNG_CACHE_DIR:/var/cache/searxng:rw" \
+    --env "SEARXNG_BIND_ADDRESS=127.0.0.1" \
+    --env "SEARXNG_PORT=$SEARXNG_PORT" \
+    --env "SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml" \
+    --env "PYTHONPATH=/usr/local/searxng" \
+    --env "TMPDIR=/var/cache/searxng" \
+    "$SEARXNG_SIF" \
+    /bin/sh -c '
+        cd /usr/local/searxng
+        exec /usr/local/searxng/.venv/bin/granian \
+            --interface wsgi --host 127.0.0.1 --port "$SEARXNG_PORT" \
+            searx.webapp:application
+    ' &
+searxng_pid=$!
+
+echo "Waiting for SearXNG to become ready on port $SEARXNG_PORT..."
+searxng_ready=0
+for _ in $(seq 1 60); do
+    if curl -sf "http://127.0.0.1:${SEARXNG_PORT}/search?q=test&format=json" >/dev/null 2>&1; then
+        searxng_ready=1
+        break
+    fi
+    if ! kill -0 "$searxng_pid" 2>/dev/null; then
+        echo "WARNING: SearXNG process exited early; web_search tool will return errors." >&2
+        break
+    fi
+    sleep 2
+done
+[ "$searxng_ready" = "1" ] || echo "WARNING: SearXNG did not become ready in time; web_search tool will return errors." >&2
+
+# --- Reference-documents index (RAG feature): a tiny CPU-only embedding
+# llama-server plus rag_index_server.py (written out by before.sh.erb),
+# both loopback-only. Mirrors the already-validated nomic-embed-text-v1.5
+# CPU-embedding pattern from this account's rag-sandbox app -- kept off the
+# GPU deliberately: the model is small enough that GPU offload wouldn't
+# meaningfully speed it up but would contend with the generation model's
+# VRAM. Indexing runs synchronously inside rag_index_server.py before it
+# starts accepting connections, so polling its /health below naturally
+# waits for indexing to finish -- same pattern as the SearXNG wait above.
+# Only started when the instructor actually set reference_docs_dir;
+# otherwise rag_port stays empty and guardrails_proxy.py skips retrieval
+# entirely, with no other change to this session's behavior.
+rag_port=""
+if [ -n "$reference_docs_dir" ]; then
+    if [ ! -f "$rag_embed_model_file" ]; then
+        echo "WARNING: reference_docs_dir is set but the embedding model is missing at $rag_embed_model_file -- run download-embedding-model.sh on a login node. Disabling the reference-documents feature for this session." >&2
+    else
+        EMBED_CONTAINER="$CONTAINER_DIR/llama-server-cpu.sif"
+        EMBED_MODEL_DIR="$(dirname "$rag_embed_model_file")"
+        rag_embed_internal_port="$(my_find_port)"
+
+        # /app/llama-server, not a bare `llama-server`: `apptainer inspect
+        # --runscript` on this image confirms its OCI entrypoint is the
+        # absolute path (`apptainer run` resolves this automatically; `exec`
+        # does not; `llama-server` was NOT confirmed to be on $PATH).
+        apptainer exec \
+            --bind "$EMBED_MODEL_DIR:$EMBED_MODEL_DIR:ro" \
+            "$EMBED_CONTAINER" \
+            /app/llama-server \
+                --host 127.0.0.1 \
+                --port "$rag_embed_internal_port" \
+                --model "$rag_embed_model_file" \
+                --embedding \
+                --pooling mean \
+                --ctx-size 2048 \
+                --batch-size 2048 \
+                --ubatch-size 2048 \
+                --threads "$RAG_EMBED_THREADS" \
+                --threads-batch "$RAG_EMBED_THREADS" \
+                --offline &
+        rag_embed_pid=$!
+
+        echo "Waiting for the reference-documents embedding server to become ready on port $rag_embed_internal_port..."
+        rag_embed_ready=0
+        for _ in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:${rag_embed_internal_port}/health" >/dev/null 2>&1; then
+                rag_embed_ready=1
+                break
+            fi
+            if ! kill -0 "$rag_embed_pid" 2>/dev/null; then
+                echo "WARNING: embedding server process exited early; reference documents will not be searchable." >&2
+                break
+            fi
+            sleep 2
+        done
+        [ "$rag_embed_ready" = "1" ] || echo "WARNING: embedding server did not become ready in time; reference documents will not be searchable." >&2
+
+        if [ "$rag_embed_ready" = "1" ]; then
+            rag_index_internal_port="$(my_find_port)"
+            apptainer exec \
+                --bind "$reference_docs_dir:$reference_docs_dir:ro" \
+                "$GPU_CONTAINER" \
+                python3 "$rag_index_script" "$rag_index_internal_port" "$reference_docs_dir" "$rag_embed_internal_port" &
+            rag_index_pid=$!
+
+            echo "Indexing reference documents under $reference_docs_dir..."
+            rag_index_ready=0
+            for _ in $(seq 1 60); do
+                if curl -sf "http://127.0.0.1:${rag_index_internal_port}/health" >/dev/null 2>&1; then
+                    rag_index_ready=1
+                    break
+                fi
+                if ! kill -0 "$rag_index_pid" 2>/dev/null; then
+                    echo "WARNING: reference-document index process exited early; reference documents will not be searchable." >&2
+                    break
+                fi
+                sleep 2
+            done
+            if [ "$rag_index_ready" = "1" ]; then
+                rag_port="$rag_index_internal_port"
+            else
+                echo "WARNING: reference-document index did not become ready in time; reference documents will not be searchable." >&2
+            fi
+        fi
+    fi
+fi
+
+# --- MCP config for llama-server's tools (web_search + literature_search).
+# llama-server spawns this as its OWN child process, inheriting its mount
+# namespace -- i.e. it runs inside the same llama-server-gpu.sif container
+# (and bwrap sandbox, if enabled) as llama-server itself, not a separate
+# environment. It assumes python3 is present in that container image; it's
+# stdlib-only specifically so nothing else has to be. See README.md if this
+# assumption turns out wrong for this image.
+#
+# timeout_ms is set explicitly rather than trusting the documented 30s
+# default: a session hung for minutes waiting on a tool call in testing,
+# well past that default, which means either it isn't actually enforced for
+# this experimental feature or something else was wrong -- the script's own
+# internal watchdog (see mcp_tools.py) is the real backstop either way.
+#
+# The MCP server is keyed "tools" (not e.g. "web_search") deliberately:
+# llama-server displays/calls MCP tools as "<server>_<tool>" (confirmed in
+# its own docs), so naming the server identically to a single tool produced
+# "web_search_web_search" in testing -- "tools" instead gives
+# "tools_web_search"/"tools_literature_search", and lets this one server
+# host as many tools as mcp_tools.py registers without a naming collision.
+mcp_config="$PWD/mcp-servers.json"
+cat > "$mcp_config" <<EOF
+{
+  "mcpServers": {
+    "tools": {
+      "command": "python3",
+      "args": ["$mcp_tools_script"],
+      "env": {"SEARXNG_PORT": "$SEARXNG_PORT"},
+      "timeout_ms": 20000
+    }
+  }
+}
+EOF
+chmod 600 "$mcp_config"
+
+# Internal-only port for the real llama-server process. $port (the port OOD
+# and students actually connect to) is now owned by guardrails_proxy.py,
+# launched below, which forwards every request here after merging in the
+# instructor's guardrails text -- this is the only path to the model, so a
+# client can't reach llama-server directly and skip that step.
+llama_internal_port="$(my_find_port)"
+
+# $PWD is read-only except .xdg-runtime (the one thing anything running in
+# here actually needs to write -- the NVIDIA driver's runtime files). This
+# narrows write access for llama-server AND anything it spawns (its own
+# built-in tools if ever enabled, or our web_search MCP subprocess) to that
+# single directory, regardless of what's bundled inside the container image.
+APPTAINER_FLAGS=(
+    --nv
+    --bind "$MODEL_DIR:$MODEL_DIR:ro"
+    --bind "$PWD:$PWD:ro"
+    --bind "$XDG_RUNTIME_DIR:$XDG_RUNTIME_DIR"
+)
+
+ARGS=(
+    --host 127.0.0.1
+    --port "$llama_internal_port"
+    --model "$model_file"
+    --ctx-size "$TOTAL_CTX"
+    --parallel "$num_slots"
+    --threads "$GEN_NUM_CPU"
+    --threads-batch "$GEN_NUM_CPU"
+    --gpu-layers 99
+    --flash-attn on
+    --cache-type-k q8_0
+    --cache-type-v q8_0
+    --batch-size "$batch_size"
+    --ubatch-size "$ubatch_size"
+    --context-shift
+    --jinja
+    --reasoning off
+    --offline
+    --metrics
+    --api-key-file "$key_file"
+    --mcp-servers-config "$mcp_config"
+)
+if [ -n "$mmproj_file" ]; then
+    ARGS+=(--mmproj "$mmproj_file")
+fi
+
+# Prompt caching: reuse cached KV state from a matching prompt prefix (e.g.
+# an unchanged system prompt, or earlier turns of the same conversation)
+# instead of reprocessing those tokens on every request. Off unless the
+# instructor opts in -- see form.yml.erb for why.
+if [ "$prompt_caching" = "1" ]; then
+    ARGS+=(--cache-reuse 256)
+fi
+
+if [ "$sandbox_llm" = "1" ]; then
+    # Filesystem/process sandboxing via bubblewrap, wrapped around the whole
+    # Apptainer launch. We deliberately do NOT unshare the network namespace:
+    # the server's listening socket has to stay reachable from OOD's rnode
+    # reverse proxy and from students on the cluster network (and now, the
+    # web_search MCP child process needs loopback access to SearXNG too) --
+    # so "sandbox" here means containment, not network isolation (see
+    # SECURITY-OVERVIEW.md).
+    #
+    # Pattern: share the host filesystem read-only (so Apptainer/Lmod/the
+    # CUDA driver see exactly what they already expect -- nothing about GPU
+    # passthrough changes), then shadow the specific paths that shouldn't be
+    # reachable with an empty tmpfs on top. This is safer than trying to
+    # enumerate every path to deny, which would risk silently breaking GPU
+    # access on a container image we don't control the internals of.
+    BWRAP_FLAGS=(
+        --ro-bind / /
+        --dev-bind /dev /dev
+        --proc /proc
+        --tmpfs "$HOME"
+        --tmpfs /tmp
+        --bind "$PWD" "$PWD"
+        --unshare-pid
+        --unshare-ipc
+        --unshare-uts
+        --die-with-parent
+        --new-session
+        --chdir "$PWD"
+    )
+    bwrap "${BWRAP_FLAGS[@]}" -- \
+        apptainer run "${APPTAINER_FLAGS[@]}" "$GPU_CONTAINER" "${ARGS[@]}" &
+else
+    apptainer run "${APPTAINER_FLAGS[@]}" "$GPU_CONTAINER" "${ARGS[@]}" &
+fi
+llama_pid=$!
+
+# --- Guardrails enforcement proxy. llama-server itself now only listens on
+# 127.0.0.1:$llama_internal_port (see ARGS above) -- this proxy is the only
+# thing bound to $port, the port OOD/students actually connect to. For every
+# POST .../chat/completions request it merges the instructor's guardrails
+# text (if any) into the request's system message before forwarding, then
+# relays the response back untouched, streaming included. Everything else
+# (static Web UI assets, /health, /metrics, the Authorization header) passes
+# through unmodified; llama-server's own --api-key-file check still runs
+# downstream exactly as before -- this proxy never inspects or validates the
+# key itself, it only ever rewrites the messages array of chat requests.
+#
+# This is the only path to the model for a REMOTE client: a student can't
+# bypass guardrails by clearing their own system message in the Web UI, or
+# by pointing a different OpenAI-compatible client at $port, the way they
+# could with llama-server's own system-prompt handling. It is NOT the only
+# path for everyone, though -- $llama_internal_port is a plain CLI arg to
+# llama-server (ARGS above), so unlike the API key (deliberately never
+# passed as a CLI arg, see before.sh.erb), it's visible via `ps`/`/proc` to
+# any other process on the same compute node, and "Sandbox the LLM
+# environment" never isolates the network namespace either way. Someone who
+# already holds a valid API key AND can run a process on this node (e.g. a
+# co-located Slurm job -- plausible on this cluster's multi-GPU node types)
+# could read that port off the process list and talk to llama-server
+# directly, skipping this proxy. It is NOT an authentication bypass -- a
+# valid key is still required -- and it does NOT make guardrails a content
+# filter either way: the model only ever sees the text as another
+# system-prompt instruction and relies on the model actually following it,
+# the same trust boundary as any other system prompt. See
+# SECURITY-OVERVIEW.md.
+#
+# Written out via heredoc for the same reason as mcp_tools.py above
+# (.erb templates are confirmed fresh every submission; a files/ copy isn't
+# as reliable in dev-mode). Runs via `apptainer exec`, not a separate
+# `apptainer run`, so it reuses the same already-required
+# python3-inside-the-container assumption instead of a new one for the bare
+# host; apptainer exec shares the host network namespace by default (no
+# --net flag here, same as the main launch above), so binding 0.0.0.0 from
+# inside the container is equivalent to binding on the host.
+guardrails_proxy_script="$PWD/guardrails_proxy.py"
+cat > "$guardrails_proxy_script" <<'OOD_GUARDRAILS_PROXY_PY_EOF'
+#!/usr/bin/env python3
+"""
+Transparent reverse proxy in front of llama-server. Forces the instructor's
+guardrails text into every chat-completions request's system message before
+forwarding, so it reaches the model even if a client never sends a system
+message, or a student edits/clears their own in the Web UI -- there is no
+path to the model that skips this. Also splices in up to a few chunks from
+the instructor's pre-loaded reference documents (RAG feature, see
+reference_docs_dir/rag_index_server.py), retrieved fresh per-request based
+on the student's latest message, when that feature is enabled for this
+session, for a request that carries some Authorization header -- the
+rewrite is skipped (and the request forwarded as-is) for one that doesn't,
+since llama-server would reject it downstream anyway and there's no reason
+to parse the body and hit the RAG index for a request going nowhere.
+Everything else (static Web UI assets, /health, /metrics, auth via the
+Authorization header) passes through unchanged; llama-server's own
+--api-key-file check still runs downstream, this proxy never inspects or
+validates the key itself.
+"""
+import http.server
+import json
+import socket
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+LISTEN_PORT = int(sys.argv[1])
+UPSTREAM_PORT = int(sys.argv[2])
+GUARDRAILS_PATH = sys.argv[3]
+RAG_PORT = sys.argv[4] if len(sys.argv) > 4 else ""
+# Falls back to the smallest tier's own value (not some larger, looser
+# number) if this somehow isn't passed -- safe-by-default, since the whole
+# point of CTX_PER_SLOT below is to avoid ever injecting more than a slot
+# can actually hold.
+CTX_PER_SLOT = int(sys.argv[5]) if len(sys.argv) > 5 else 4096
+UPSTREAM = f"http://127.0.0.1:{UPSTREAM_PORT}"
+RAG_URL = f"http://127.0.0.1:{RAG_PORT}/retrieve" if RAG_PORT else ""
+# Kept short and separate from the generation request's own long timeout
+# below -- retrieval runs once per chat request and must never be the thing
+# that makes a request slow; a student's question still gets answered
+# (without reference-document context) if this doesn't come back quickly.
+RAG_TIMEOUT_SECONDS = 3
+# Reference-document context is capped at a FRACTION of the slot's own
+# context window, not a fixed chunk count -- a fixed "top 3 chunks" budget
+# that's comfortable on an 8192-token (medium tier) slot can, combined with
+# guardrails text and the tool-call schemas llama-server injects for
+# --jinja, overflow a 4096-token (small/large tier) slot outright on a
+# single turn (confirmed in testing: a large reference-documents corpus
+# pushed one request to 4119 tokens against a 4096 budget). --context-shift
+# only helps a conversation that *grows* past the window over many turns;
+# it can't save a single oversized request. CHARS_PER_TOKEN is a rough,
+# deliberately conservative (denser-than-typical-English) estimate -- there
+# is no tokenizer available in this environment (same stdlib-only
+# constraint as the MCP tools script) -- biased to under-count how much
+# text fits, not over-count it.
+RAG_CONTEXT_FRACTION = 0.25
+CHARS_PER_TOKEN = 3
+RAG_MAX_CHARS = int(CTX_PER_SLOT * RAG_CONTEXT_FRACTION * CHARS_PER_TOKEN)
+
+# A client that declares a Content-Length but never finishes sending the body
+# would otherwise block this connection's thread forever (no API key is
+# required to reach this point, so this has to hold up against anyone who
+# can reach the port, not just valid students). MAX_BODY_BYTES is generous
+# enough for a full-context conversation (the largest tier's total context
+# is 131072 tokens) with JSON overhead to spare.
+REQUEST_TIMEOUT_SECONDS = 20
+MAX_BODY_BYTES = 8_000_000
+
+try:
+    with open(GUARDRAILS_PATH, "r") as f:
+        GUARDRAILS_TEXT = f.read().strip()
+except OSError:
+    GUARDRAILS_TEXT = ""
+
+
+def _message_text(message):
+    # The Web UI's content can be a plain string or a list of content parts
+    # (text/image/file blocks); only the text parts are useful as a
+    # retrieval query.
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(parts)
+    return ""
+
+
+def fetch_rag_context(messages):
+    if not RAG_URL:
+        return None
+    query = ""
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            query = _message_text(message).strip()
+            break
+    if not query:
+        return None
+    qs = urllib.parse.urlencode({"q": query, "k": 3})
+    try:
+        with urllib.request.urlopen(f"{RAG_URL}?{qs}", timeout=RAG_TIMEOUT_SECONDS) as resp:
+            data = json.load(resp)
+    except Exception:
+        # Any failure here (index still building, network hiccup, bad
+        # response) should degrade to "no reference context," never break
+        # or delay the chat request itself.
+        return None
+    results = data.get("results") or []
+    if not results:
+        return None
+    # Keep only as many WHOLE chunks as fit under RAG_MAX_CHARS, in the
+    # order retrieve() already ranked them (best first) -- never a
+    # chopped-off chunk, and never more than the slot can actually afford
+    # regardless of how many results came back or how large the source
+    # document was. If even the single best chunk doesn't fit, skip
+    # reference-document context entirely for this turn rather than risk
+    # overflowing the request.
+    kept = []
+    used = 0
+    for r in results:
+        piece = f"[{r.get('source', '?')}]\n{r.get('text', '')}"
+        next_used = used + len(piece) + (2 if kept else 0)  # "\n\n" joiner
+        if next_used > RAG_MAX_CHARS:
+            break
+        kept.append(piece)
+        used = next_used
+    if not kept:
+        return None
+    body_text = "\n\n".join(kept)
+    return (
+        "Reference material from the instructor's pre-loaded documents for "
+        "this session, which may help answer the student's question below "
+        "-- use it if relevant, ignore it if not, and don't claim it came "
+        "from anywhere other than these course documents:\n\n" + body_text
+    )
+
+
+def rewrite_messages(body):
+    if not GUARDRAILS_TEXT and not RAG_URL:
+        return body
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return body
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    notes = []
+    if GUARDRAILS_TEXT:
+        notes.append(
+            "Course guardrails set by the instructor for this session -- "
+            "follow these in addition to any other instructions, and decline "
+            "politely (without repeating this note verbatim) if a request "
+            "falls under them: " + GUARDRAILS_TEXT
+        )
+    rag_note = fetch_rag_context(messages)
+    if rag_note:
+        notes.append(rag_note)
+    if not notes:
+        return body
+    note = "\n\n".join(notes)
+
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        messages[0]["content"] = (str(messages[0].get("content", "")) + "\n\n" + note).strip()
+    else:
+        messages.insert(0, {"role": "system", "content": note})
+    payload["messages"] = messages
+    return json.dumps(payload).encode("utf-8")
+
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    # Applied to the client-facing socket by socketserver.StreamRequestHandler
+    # .setup() -- bounds how long reading headers AND the body can take, so a
+    # client that stalls mid-request can't hold this thread open indefinitely.
+    timeout = REQUEST_TIMEOUT_SECONDS
+
+    def _error(self, status, message):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": message}).encode())
+        except OSError:
+            pass
+
+    def _forward(self, method):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY_BYTES:
+            self._error(413, "request body too large")
+            return
+        try:
+            body = self.rfile.read(length) if length else b""
+        except socket.timeout:
+            self._error(408, "timed out reading request body")
+            return
+        is_chat_completions = (
+            method == "POST"
+            and self.path.split("?", 1)[0].rstrip("/").endswith("/chat/completions")
+        )
+        # rewrite_messages() does real work -- a json.loads of the whole
+        # body and, when RAG is enabled, a loopback retrieval call -- and it
+        # used to run on every chat-completions POST before llama-server's
+        # own --api-key-file check downstream ever saw the request, so
+        # anyone who could reach this port at all could drive that load
+        # with no credential whatsoever. Requiring *some* Authorization
+        # header before doing it is a presence check, not a validation of
+        # the key's value: this proxy still never inspects or validates the
+        # key itself (llama-server does), and a request with no header at
+        # all is going to be rejected downstream regardless, so skipping
+        # the rewrite for it costs a legitimate client nothing.
+        if is_chat_completions and self.headers.get("Authorization"):
+            body = rewrite_messages(body)
+
+        headers = {
+            k: v for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length", "connection")
+        }
+        if body or method in ("POST", "PUT"):
+            headers["Content-Length"] = str(len(body))
+
+        req = urllib.request.Request(
+            UPSTREAM + self.path,
+            data=body if method in ("POST", "PUT") else None,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                self._relay(resp.status, resp.getheaders(), resp)
+        except urllib.error.HTTPError as exc:
+            self._relay(exc.code, exc.headers.items() if exc.headers else [], exc)
+        except Exception:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b'{"error":"model server not ready"}')
+
+    def _relay(self, status, resp_headers, fp):
+        self.send_response(status)
+        for k, v in resp_headers:
+            if k.lower() in ("transfer-encoding", "connection"):
+                continue
+            self.send_header(k, v)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        while True:
+            chunk = fp.read(8192)
+            if not chunk:
+                break
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                break
+
+    def do_GET(self):
+        self._forward("GET")
+
+    def do_POST(self):
+        self._forward("POST")
+
+    def do_PUT(self):
+        self._forward("PUT")
+
+    def do_OPTIONS(self):
+        self._forward("OPTIONS")
+
+    def log_message(self, *_args):
+        pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+if __name__ == "__main__":
+    Server(("0.0.0.0", LISTEN_PORT), Proxy).serve_forever()
+OOD_GUARDRAILS_PROXY_PY_EOF
+chmod 644 "$guardrails_proxy_script"
+
+apptainer exec --bind "$PWD:$PWD:ro" "$GPU_CONTAINER" \
+    python3 "$guardrails_proxy_script" "$port" "$llama_internal_port" "$guardrails_path" "$rag_port" "$ctx_per_slot" &
+guardrails_proxy_pid=$!
+
+cleanup() {
+    # Remove the shared, student-discoverable directory this session
+    # published into the course's own storage (see before.sh.erb) -- the
+    # requested "clean up when done" behavior. Runs on normal completion,
+    # `scancel` (including the idle-shutdown path below), and signals alike,
+    # since this trap already covers EXIT/INT/TERM.
+    if [ -n "${shared_session_dir:-}" ]; then
+        rm -rf -- "$shared_session_dir" 2>/dev/null || true
+    fi
+    if [ -n "${idle_watch_pid:-}" ] && kill -0 "$idle_watch_pid" 2>/dev/null; then
+        kill "$idle_watch_pid" 2>/dev/null || true
+    fi
+    if [ -n "${idle_poll_header_file:-}" ]; then
+        rm -f -- "$idle_poll_header_file" 2>/dev/null || true
+    fi
+    if [ -n "${guardrails_proxy_pid:-}" ] && kill -0 "$guardrails_proxy_pid" 2>/dev/null; then
+        kill "$guardrails_proxy_pid" 2>/dev/null || true
+    fi
+    if [ -n "${rag_index_pid:-}" ] && kill -0 "$rag_index_pid" 2>/dev/null; then
+        kill "$rag_index_pid" 2>/dev/null || true
+    fi
+    if [ -n "${rag_embed_pid:-}" ] && kill -0 "$rag_embed_pid" 2>/dev/null; then
+        kill "$rag_embed_pid" 2>/dev/null || true
+    fi
+    if kill -0 "$searxng_pid" 2>/dev/null; then
+        kill "$searxng_pid" 2>/dev/null || true
+        wait "$searxng_pid" 2>/dev/null || true
+    fi
+    rm -rf -- "$SEARXNG_CACHE_DIR"
+}
+# Registered *before* the connection-info publishing block below,
+# deliberately -- a real run already hit exactly the failure mode this
+# ordering prevents: an earlier bug in that block (course_group unbound,
+# since fixed) crashed the script before this trap existed yet, leaving
+# shared_session_dir's contents orphaned in the course's storage forever
+# (nothing else ever cleans up a stray *.tmp.$$ file). Whatever runs after
+# this line is covered no matter what fails next.
+trap cleanup EXIT INT TERM
+
+# --- Publish this session's connection info for the Student role to find.
+# $port is now live end-to-end (guardrails_proxy_pid above), so this is the
+# right moment to announce it. Two independent channels, not just a
+# belt-and-suspenders duplicate of each other:
+#
+#   - The Slurm job's own Comment field, via `scontrol update` -- the
+#     *primary* mechanism (see the app's own design notes: "prefer to check
+#     Slurm" over reading anything under this job's own, permission-
+#     restricted OOD session directory). A student's viewer job finds this
+#     with a plain `squeue --name=... --format='%k'`, no filesystem access
+#     into this job's files required at all.
+#   - $shared_session_file, in the course's own storage directory (created
+#     in before.sh.erb) -- a fallback/mirror in case this cluster's Slurm
+#     `PrivateData` setting restricts cross-user squeue visibility (not
+#     verified from an unprivileged dev shell when this was written; see
+#     SECURITY-OVERVIEW.md).
+#
+# Both best-effort: a failure here (e.g. `scontrol` permission weirdness, or
+# the course storage mount hiccuping) degrades to "students can't
+# auto-discover this session," never fails the job itself -- the Base
+# URL/keys are still shown on this (Faculty) connection page regardless.
+host="$(hostname -s 2>/dev/null || hostname)"
+scontrol update JobId="${SLURM_JOB_ID:-}" Comment="host=${host};port=${port}" >/dev/null 2>&1 || true
+if [ -n "${shared_session_file:-}" ]; then
+    json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n'; }
+    tmp_session_file="${shared_session_file}.tmp.$$"
+    if cat > "$tmp_session_file" <<EOF
+{"course_name": "$(json_escape "$course_name")", "tier_label": "$(json_escape "$tier_label")", "model_label": "$(json_escape "$model_label")", "job_id": "${SLURM_JOB_ID:-}", "host": "$(json_escape "$host")", "port": $port, "status": "running"}
+EOF
+    then
+        chmod 640 "$tmp_session_file" 2>/dev/null || true
+        chgrp "$course_group" "$tmp_session_file" 2>/dev/null || true
+        mv -f "$tmp_session_file" "$shared_session_file" 2>/dev/null || rm -f "$tmp_session_file"
+    else
+        rm -f "$tmp_session_file" 2>/dev/null || true
+    fi
+fi
+
+# --- Idle shutdown: a shared GPU session left running unattended wastes a
+# resource other classes need. Polls llama-server's own --metrics endpoint
+# (already enabled) for requests_processing + requests_deferred; after
+# IDLE_CHECKS consecutive zero-activity checks (120 x 60s = 2 hours), ends
+# the job with scancel. 2 hours is a judgment call: long enough to tolerate
+# a full class period's worth of pauses between messages (and testing
+# sessions that sit idle between checks) without killing a live session
+# mid-exercise, while still eventually reclaiming an abandoned GPU rather
+# than holding it indefinitely.
+IDLE_CHECK_INTERVAL=60
+IDLE_CHECKS_BEFORE_SHUTDOWN=120
+first_key="$(head -n1 "$key_file" 2>/dev/null || true)"
+# A real student API key, same as $key_file itself -- never pass it as a
+# literal curl argument (`-H "Authorization: Bearer $first_key"` would sit in
+# this process's argv, readable via ps/proc by any other user on a shared
+# compute node for the life of every poll). curl's -K config-file form reads
+# the header from a file instead, same convention as --api-key-file above.
+# $key_dir itself was never exported by before.sh.erb (only $key_file
+# crosses the before.sh.erb/script.sh.erb process boundary) -- this crashed
+# outright under `set -u` the moment a real session reached this line
+# (confirmed directly: "line 939: key_dir: unbound variable" killed the
+# job right as the idle-shutdown watcher was being set up). Derive the same
+# directory from $key_file instead of adding a second export for it.
+idle_poll_header_file="$(dirname "$key_file")/idle-poll.header"
+( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$first_key" > "$idle_poll_header_file" )
+chmod 600 "$idle_poll_header_file"
+
+idle_watch() {
+    local idle_count=0
+    while kill -0 "$llama_pid" 2>/dev/null; do
+        sleep "$IDLE_CHECK_INTERVAL"
+        local busy
+        # `|| true`: under set -e/pipefail, a transient curl failure (e.g. a
+        # hiccup, not real idleness) would otherwise kill this whole watcher
+        # subshell silently, permanently disabling idle-shutdown for the rest
+        # of the job with no indication anything broke.
+        busy="$(curl -sf -K "$idle_poll_header_file" "http://127.0.0.1:${llama_internal_port}/metrics" 2>/dev/null \
+            | awk '/^llamacpp:requests_processing/{p=$2} /^llamacpp:requests_deferred/{d=$2} END{print (p+0)+(d+0)}')" || true
+        if [ -z "$busy" ] || [ "$busy" = "0" ]; then
+            idle_count=$((idle_count + 1))
+        else
+            idle_count=0
+        fi
+        if [ "$idle_count" -ge "$IDLE_CHECKS_BEFORE_SHUTDOWN" ]; then
+            echo "Idle for $((IDLE_CHECK_INTERVAL * IDLE_CHECKS_BEFORE_SHUTDOWN / 60)) minutes with no active or queued requests; ending session to free the GPU." >&2
+            # Done here, synchronously, before scancel -- not left to the
+            # EXIT/TERM trap's cleanup() alone. Confirmed directly against a
+            # real idle-shutdown that the shared directory survived anyway:
+            # scancel'ing this job's own SLURM_JOB_ID from a background
+            # subshell doesn't reliably leave the main script's trap time to
+            # run cleanup() before the job's whole process tree is torn
+            # down. This is a duplicate of cleanup()'s own shared_session_dir
+            # removal, deliberately -- cleanup() is still the right place
+            # for every other termination path (normal completion, manual
+            # cancel, signals), just not proven reliable for this
+            # self-inflicted one.
+            if [ -n "${shared_session_dir:-}" ]; then
+                rm -rf -- "$shared_session_dir" 2>/dev/null || true
+            fi
+            scancel "${SLURM_JOB_ID:-$$}" 2>/dev/null || kill "$llama_pid" 2>/dev/null || true
+            return
+        fi
+    done
+}
+idle_watch &
+idle_watch_pid=$!
+
+wait "$llama_pid"

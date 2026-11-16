@@ -1,0 +1,15 @@
+# Per-site overrides for this app -- see lib/site_config.rb for how these
+# are read and used. Copy this file to config/site.yml and uncomment/edit
+# only the keys you need to change; anything left out keeps the Tufts
+# default shown below. An absent config/site.yml (the out-of-the-box case)
+# is exactly today's Tufts behavior.
+#
+# storage_root: /cluster/tufts
+# admin_group_suffix: admin
+# connection_host_suffix: .pax.tufts.edu
+# student_lookup_partition: batch,preempt
+# container_dir: /cluster/tufts/apps/container/ai/images
+# searxng_image: /cluster/tufts/ngc/images/searxng_2026.7.9.sif
+#
+# Not covered here: lib/class_tiers.rb (the GPU constraint/model-catalog
+# table) and the model paths inside it -- see README.md section 1.

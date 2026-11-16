@@ -1,0 +1,442 @@
+<% require 'csv' %>
+<% require 'json' %>
+<%
+# course_name and the roster's name column are free-text fields a faculty
+# member pastes in -- unlike before.sh.erb/script.sh.erb (confirmed
+# elsewhere in this app to render via plain ERB with no filename context),
+# it's not certain this view goes through Rails' normal auto-escaping
+# pipeline, so escape explicitly with plain String#gsub (no 'erb'/CGI
+# dependency) rather than assume either is loaded in this binding.
+esc = lambda do |s|
+s.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub('"', '&quot;').gsub("'", '&#39;')
+end
+%>
+<div class="alert alert-warning">
+<strong>Usage Disclaimer:</strong> AI-generated content may be incorrect,
+biased, incomplete, or misleading. Always review, verify, and edit AI
+output before use. Before sending any data to this tool, please review the
+<a href="https://it.tufts.edu/sites/default/files/uploaded-files/2018-09/information-classification-handling_2018-06-18_0.pdf"
+target="_blank" rel="noopener">Tufts Information Classification and Handling Policy</a>
+and the <a href="https://access.tufts.edu/data-finder" target="_blank" rel="noopener">Data Storage Finder</a>.
+For requirements and best practices, see Tufts&rsquo;
+<a href="https://it.tufts.edu/ai/guidance-using-ai-tufts" target="_blank" rel="noopener">Guidelines for Use of Generative AI Tools</a>.
+</div>
+
+<% if role == "student" %>
+<%
+# status_path is refreshed by script.sh.erb's own polling loop roughly every
+# 15 seconds -- re-read fresh on every page load/poll rather than cached
+# from whenever this job first started, same reasoning as roster_csv/
+# guardrails_path below on the Faculty side (a page opened right after
+# submission would otherwise permanently bake in "no session found").
+status = {}
+if File.exist?(status_path)
+  begin
+    status = JSON.parse(File.read(status_path))
+  rescue StandardError
+    status = {}
+  end
+end
+# Same course-code pattern as lib/course_storage.rb's NAME_PATTERN, inlined
+# rather than loaded from there -- unlike before.sh.erb/script.sh.erb
+# (confirmed to accept `session.app.root`-based `load`), it isn't verified
+# that this view's own ERB binding exposes `session` the same way, so this
+# avoids depending on that for a single regex.
+course_match = course_group.to_s.match(/\Ac\d{2}[a-z]{2}\d([a-z]+\d+)\z/i)
+course_label = course_match ? course_match[1].upcase : (course_group.to_s.empty? ? 'your course' : course_group)
+found = status['found'] == true
+api_key = status['api_key'].to_s
+%>
+
+<h5><%= esc.(course_label) %></h5>
+
+<% if course_group.to_s.empty? %>
+<div class="alert alert-secondary">
+Couldn't confirm you belong to this course's storage group, so there's
+nothing to look up here. Ask your instructor for the connection link and
+your API key directly.
+</div>
+<% elsif !found %>
+<div class="alert alert-secondary" id="status-indicator">
+No active session found for this course yet. This page checks again every
+15 seconds -- no need to reload manually. If this doesn't clear within a
+minute or two, confirm with your instructor that they've started the
+session.
+</div>
+<% else %>
+<div id="status-indicator" class="alert alert-secondary">
+Session found -- checking whether the model is actually ready to accept
+requests...
+</div>
+
+<div id="connection-details" style="display: none;">
+<div class="d-grid gap-3">
+<div class="input-group">
+<span class="input-group-text" style="width: 6em;"><strong>Base URL</strong></span>
+<span class="form-control"><code id="base-url">http://<%= esc.(status['host']) %><%= esc.(connection_host_suffix) %>:<%= esc.(status['port']) %>/v1</code></span>
+<button class="btn btn-light far fa-copy copy-btn" type="button" data-target="base-url" style="aspect-ratio: 1 / 1;" title="Copy Base URL"></button>
+</div>
+<small class="form-text text-muted mt-n2">
+Use this as the <code>base_url</code>/<code>apiBase</code> in any
+OpenAI-compatible client, or just use the Web UI below.
+</small>
+</div>
+
+<% if api_key.empty? %>
+<div class="alert alert-warning mt-3">
+No API key found for your account in this session -- this can happen for a
+minute or two right after the session starts, or if your instructor used a
+manually-typed roster instead of the course's own storage group. Ask your
+instructor to confirm you're on the roster if it doesn't clear shortly.
+</div>
+<% else %>
+<div class="input-group mt-3">
+<span class="input-group-text" style="min-width: 10em;">Your API key</span>
+<span class="form-control"><code id="my-key"><%= esc.(api_key) %></code></span>
+<button class="btn btn-light far fa-copy copy-btn" type="button" data-target="my-key" style="aspect-ratio: 1 / 1;" title="Copy key"></button>
+</div>
+<p class="text-muted mt-2" style="font-size: 0.9em;">
+The Web UI needs an API key to load -- Launch below pre-fills it for you
+automatically. If it doesn't appear, open Settings (gear icon) and paste in
+the key above.
+</p>
+<% end %>
+
+<div class="d-flex gap-2 mt-3">
+<a href="/rnode/<%= esc.(status['host']) %>/<%= esc.(status['port']) %>/" class="btn btn-primary" id="launch-button" target="_blank" rel="noopener">
+<i class="fa fa-eye"></i> Launch Web UI
+</a>
+</div>
+</div>
+<% end %>
+
+<script>
+<% if found %>
+(function() {
+// Mirrors the Faculty page's own readiness gate (see the script at the
+// bottom of this file): the instructor's job only publishes "found: true"
+// once guardrails_proxy.py is listening, but llama-server itself can still
+// be mid model-load behind it -- a bare "found" is not the same as "ready
+// to answer", and clicking Launch too early reproduces the exact
+// loading-model 503 this gate exists to catch before the student ever
+// sees it.
+var statusEl = document.getElementById('status-indicator');
+var detailsEl = document.getElementById('connection-details');
+var baseUrl = '/rnode/<%= esc.(status['host']) %>/<%= esc.(status['port']) %>';
+var apiKey = <%= api_key.empty? ? 'null' : api_key.to_json %>;
+
+function setStatus(cls, text) {
+if (!statusEl) return;
+statusEl.className = 'alert alert-' + cls;
+statusEl.textContent = text;
+}
+
+var revealed = false;
+function reveal() {
+if (revealed || !detailsEl) return;
+revealed = true;
+detailsEl.style.display = '';
+if (statusEl) statusEl.style.display = 'none';
+// Seeded here, at the real readiness condition, not on a 'mouseover'
+// listener -- see the Faculty script below for why that matters on
+// touch devices.
+//
+// Write under both prefixes the bundled Web UI has used (confirmed
+// directly against a live session's served bundle.js: the active
+// prefix is now "LlamaUi", with "LlamaCppWebui" kept only as a
+// one-time, opt-in migration source the Web UI does not run
+// automatically) -- a version mismatch between what this app assumes
+// and what the container image actually ships otherwise seeds a key
+// the Web UI never reads, landing it on "unauthorized: Invalid API
+// Key" on first load with no obvious cause.
+if (apiKey) {
+var webuiConfig = JSON.stringify({apiKey: apiKey});
+localStorage.setItem('LlamaUi.config', webuiConfig);
+localStorage.setItem('LlamaCppWebui.config', webuiConfig);
+}
+}
+
+function poll() {
+fetch(baseUrl + '/health').then(function(r) {
+if (r.status === 503) {
+setStatus('warning', 'Model is still loading. This can take a minute or two.');
+return;
+}
+if (!r.ok) {
+setStatus('secondary', 'Server not responding yet.');
+return;
+}
+reveal();
+}).catch(function() {
+setStatus('secondary', 'Checking server status...');
+});
+}
+poll();
+setInterval(poll, 5000);
+})();
+<% end %>
+setTimeout(function() { window.location.reload(); }, 15000);
+// navigator.clipboard requires a secure context and can be missing or
+// silently reject outright (confirmed directly: a faculty member's "Copy"
+// click reported nothing landed on the clipboard) -- the execCommand
+// fallback below covers both "not available at all" and "available but
+// the write itself failed" cases. The key is always plain, selectable text
+// in the <code> element either way, so manual select-and-copy keeps
+// working regardless of which path this takes.
+function legacyCopy(text) {
+const ta = document.createElement('textarea');
+ta.value = text;
+ta.style.position = 'fixed';
+ta.style.opacity = '0';
+document.body.appendChild(ta);
+ta.focus();
+ta.select();
+try { document.execCommand('copy'); } catch (e) { /* nothing more to try */ }
+document.body.removeChild(ta);
+}
+function copyToClipboard(text) {
+if (navigator.clipboard && navigator.clipboard.writeText) {
+navigator.clipboard.writeText(text).catch(function() { legacyCopy(text); });
+} else {
+legacyCopy(text);
+}
+}
+document.querySelectorAll('.copy-btn').forEach(btn => {
+btn.addEventListener('click', function() {
+const targetId = btn.getAttribute('data-target');
+const code = document.getElementById(targetId).innerText;
+copyToClipboard(code);
+btn.classList.remove('fa-copy');
+btn.classList.add('fa-check-square');
+setTimeout(() => {
+btn.classList.remove('fa-check-square');
+btn.classList.add('fa-copy');
+}, 1500);
+});
+});
+</script>
+
+<% else %>
+<%
+roster_rows = File.exist?(roster_csv) ? CSV.read(roster_csv, headers: true) : []
+first_key = roster_rows.first && roster_rows.first['api_key']
+guardrails_text = File.exist?(guardrails_path) ? File.read(guardrails_path).strip : ''
+%>
+
+<h5><%= esc.(course_name) %></h5>
+
+<div id="status-indicator" class="alert alert-secondary">
+Checking server status...
+</div>
+<p class="text-muted" style="font-size: 0.9em;">
+Don't share the link with students until this says Ready. The page will
+refresh itself once it is -- no need to reload manually.
+</p>
+
+<div id="connection-details" style="display: none;">
+<h5>Connection information (same for every student)</h5>
+<div class="d-grid gap-3">
+<div class="input-group">
+<span class="input-group-text" style="width: 6em;"><strong>Base URL</strong></span>
+<span class="form-control"><code id="base-url">http://<%= esc.(host) %><%= esc.(connection_host_suffix) %>:<%= esc.(port) %>/v1</code></span>
+<button class="btn btn-light far fa-copy copy-btn" type="button" data-target="base-url" style="aspect-ratio: 1 / 1;" title="Copy Base URL"></button>
+</div>
+<small class="form-text text-muted mt-n2">
+Use this as the <code>base_url</code>/<code>apiBase</code> in any
+OpenAI-compatible client, or just use the Web UI below.
+</small>
+</div>
+
+<p class="mb-1 mt-2">
+The Web UI needs an API key to load, so Launch pre-fills the
+<strong>first</strong> row's key. If that isn't yours, open Settings (gear
+icon) and swap in <strong>your own</strong> key from the list below --
+tool/function calling works for every key. <code>web_search</code> and
+<code>literature_search</code> tools are also available; those queries go
+out through a local search instance or a public academic API, not the rest
+of the conversation.
+</p>
+<div class="d-flex gap-2">
+<a href="/rnode/<%= host %>/<%= port %>/" class="btn btn-primary" id="launch-button" target="_blank" rel="noopener">
+<i class="fa fa-eye"></i> Launch Web UI
+</a>
+<a href="/pun/sys/dashboard/files/fs/<%= output_log %>" class="btn btn-secondary">
+<i class="fa fa-file-text"></i> View Server Log
+</a>
+</div>
+</div>
+
+<hr />
+
+<details class="mb-3">
+<summary style="cursor: pointer;">Session details (tier, guardrails, sharing model, roster &amp; keys)</summary>
+<p class="mb-2 mt-2">
+<strong><%= tier_label %></strong>, model: <code><%= model_label %></code>,
+<%= sandbox_llm.to_s == "1" ? "sandboxed" : "not sandboxed" %>,
+prompt caching <%= prompt_caching.to_s == "1" ? "on" : "off" %>
+</p>
+<% unless guardrails_text.empty? %>
+<div class="alert alert-info">
+<strong>Guardrails for this session:</strong> added to the model's system
+prompt on every request, so it applies no matter which client connects --
+but it's still just an instruction to the model, not a content filter, and
+isn't guaranteed to hold up against a determined attempt to work around it.
+<pre class="mb-0" style="white-space: pre-wrap; font-family: inherit;"><%= esc.(guardrails_text) %></pre>
+</div>
+<% end %>
+<div class="alert alert-info mb-0">
+This GPU is shared across <strong><%= num_slots %></strong> concurrent
+inference slots instead of giving each student their own job. Every
+student's API key talks to the <em>same</em> running model, and requests
+queue briefly only if more than <%= num_slots %> students ask at once.
+</div>
+
+<div id="roster-details" style="display: none;">
+<hr />
+<h5>Student roster &amp; API keys</h5>
+<% if roster_rows.empty? %>
+<p class="text-muted">No roster found for this session.</p>
+<% else %>
+<p class="mb-1">
+Give each student only their own key. Anyone holding a key can use the
+server (and see data sent with it), so don't post this list publicly.
+</p>
+<div class="d-grid gap-2" style="max-height: 320px; overflow-y: auto;">
+<% roster_rows.each_with_index do |row, i| %>
+<div class="input-group">
+<span class="input-group-text" style="min-width: 10em;"><%= esc.(row['name']) %></span>
+<span class="form-control"><code id="key-<%= i %>"><%= esc.(row['api_key']) %></code></span>
+<button class="btn btn-light far fa-copy copy-btn" type="button" data-target="key-<%= i %>" style="aspect-ratio: 1 / 1;" title="Copy key"></button>
+</div>
+<% end %>
+</div>
+<a class="btn btn-secondary btn-sm mt-2" href="/pun/sys/dashboard/files/fs/<%= roster_csv %>">
+<i class="fa fa-file-text"></i> Open roster.csv
+</a>
+<% end %>
+</div>
+</details>
+
+<script>
+(function() {
+var statusEl = document.getElementById('status-indicator');
+var baseUrl = '/rnode/<%= host %>/<%= port %>';
+var firstKey = <%= first_key ? "\"#{first_key}\"" : 'null' %>;
+
+function setStatus(cls, text) {
+statusEl.className = 'alert alert-' + cls;
+statusEl.textContent = text;
+}
+
+var revealed = false;
+function reveal() {
+if (revealed) return;
+revealed = true;
+// The roster/guardrails sections below are rendered server-side exactly
+// once, from whatever roster.csv/guardrails.txt looked like the moment
+// this page was first loaded -- if that happened while the job was still
+// starting up (common: people check right after submitting), roster.csv
+// can still be just the header line, baking in an empty roster that no
+// amount of client-side polling will ever fix, since nothing here re-fetches
+// the roster from the server. Force exactly one full reload on the first
+// ready-transition so the page re-renders from the server with roster.csv
+// as it actually looks by now (always populated well before the model
+// finishes loading) -- the #ready hash survives the reload and prevents a
+// second one.
+if (window.location.hash !== '#ready') {
+window.location.hash = 'ready';
+window.location.reload();
+return;
+}
+document.getElementById('connection-details').style.display = '';
+document.getElementById('roster-details').style.display = '';
+// Seeded here, where the Launch button actually becomes visible/clickable,
+// rather than on a 'mouseover' listener -- mouseover doesn't reliably fire
+// before a tap on touch devices, which could skip the seed entirely and
+// send the Web UI to 401 on its first load, the exact failure this exists
+// to prevent (see SECURITY-OVERVIEW.md).
+//
+// Write under both prefixes the bundled Web UI has used -- see the
+// matching comment in the Student script above.
+if (firstKey) {
+var webuiConfig = JSON.stringify({apiKey: firstKey});
+localStorage.setItem('LlamaUi.config', webuiConfig);
+localStorage.setItem('LlamaCppWebui.config', webuiConfig);
+}
+}
+
+function poll() {
+fetch(baseUrl + '/health').then(function(r) {
+if (r.status === 503) {
+setStatus('warning', 'Model is still loading. This can take a minute or two.');
+return;
+}
+if (!r.ok) {
+setStatus('secondary', 'Server not responding yet.');
+return;
+}
+reveal();
+if (!firstKey) {
+setStatus('success', 'Ready.');
+return;
+}
+fetch(baseUrl + '/metrics', {headers: {Authorization: 'Bearer ' + firstKey}})
+.then(function(mr) { return mr.ok ? mr.text() : null; })
+.then(function(text) {
+var processing = text && text.match(/^llamacpp:requests_processing\s+(\d+)/m);
+var deferred = text && text.match(/^llamacpp:requests_deferred\s+(\d+)/m);
+if (processing) {
+var queued = deferred && deferred[1] !== '0' ? ', ' + deferred[1] + ' queued' : '';
+setStatus('success', 'Ready. ' + processing[1] + ' request(s) processing' + queued + '.');
+} else {
+setStatus('success', 'Ready.');
+}
+})
+.catch(function() { setStatus('success', 'Ready.'); });
+}).catch(function() {
+setStatus('secondary', 'Checking server status...');
+});
+}
+poll();
+setInterval(poll, 15000);
+})();
+// navigator.clipboard requires a secure context and can be missing or
+// silently reject outright (confirmed directly: a faculty member's "Copy"
+// click reported nothing landed on the clipboard) -- the execCommand
+// fallback below covers both "not available at all" and "available but
+// the write itself failed" cases. The key is always plain, selectable text
+// in the <code> element either way, so manual select-and-copy keeps
+// working regardless of which path this takes.
+function legacyCopy(text) {
+const ta = document.createElement('textarea');
+ta.value = text;
+ta.style.position = 'fixed';
+ta.style.opacity = '0';
+document.body.appendChild(ta);
+ta.focus();
+ta.select();
+try { document.execCommand('copy'); } catch (e) { /* nothing more to try */ }
+document.body.removeChild(ta);
+}
+function copyToClipboard(text) {
+if (navigator.clipboard && navigator.clipboard.writeText) {
+navigator.clipboard.writeText(text).catch(function() { legacyCopy(text); });
+} else {
+legacyCopy(text);
+}
+}
+document.querySelectorAll('.copy-btn').forEach(btn => {
+btn.addEventListener('click', function() {
+const targetId = btn.getAttribute('data-target');
+const code = document.getElementById(targetId).innerText;
+copyToClipboard(code);
+btn.classList.remove('fa-copy');
+btn.classList.add('fa-check-square');
+setTimeout(() => {
+btn.classList.remove('fa-check-square');
+btn.classList.add('fa-copy');
+}, 1500);
+});
+});
+</script>
+<% end %>

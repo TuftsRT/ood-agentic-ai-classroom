@@ -1,0 +1,63 @@
+# <% load File.join(__dir__, "lib/site_config.rb") %>
+# <% load File.join(__dir__, "lib/class_tiers.rb") %>
+# <% load File.join(__dir__, "lib/course_storage.rb") %>
+# <% is_student = role_select.to_s == "student" %>
+# <% if is_student %>
+#   <% raw_group = course_select_student %>
+# <% else %>
+#   <% tier = ClassTiers.fetch(class_size) %>
+#   <% raw_group = course_group %>
+# <% end %>
+# job_name is shared between both roles so a student's lookup job can find
+# the instructor's GPU job (and vice versa, for the "already running"
+# dropdown hint on the Faculty side) purely via `squeue --name=...` -- see
+# lib/course_storage.rb's job_name_for. Falls back to a fixed, non-course
+# name for ad hoc/manual ("Other") sessions, which have no storage group to
+# key off of and also never show up in the Student dropdown in the first
+# place, so there's nothing for a student job to discover there anyway.
+# <% job_name = CourseStorage.job_name_for(raw_group) || "llm-classroom-sandbox/adhoc" %>
+---
+batch_connect:
+  template: "basic"
+  conn_params:
+    - "output_log"
+    - "role"
+    - "connection_host_suffix"
+    # <% if is_student %>
+    - "course_group"
+    - "status_path"
+    # <% else %>
+    - "course_name"
+    - "tier_label"
+    - "model_label"
+    - "num_slots"
+    - "roster_csv"
+    - "sandbox_llm"
+    - "guardrails_path"
+    - "prompt_caching"
+    # <% end %>
+script:
+  job_name: "<%= job_name %>"
+  wall_time: <%= num_hours.to_i * 3600 %>
+  native:
+    # <% if is_student %>
+    # A lookup job, not a model session -- no GPU, smallest practical
+    # allocation. Not the "gpu" partition (that's for the Faculty branch
+    # below) so it never competes with actual GPU-tier jobs for that
+    # partition's queue; the actual partition name(s) are a per-site value
+    # (SiteConfig.student_lookup_partition, Tufts default "batch,preempt" --
+    # see lib/site_config.rb).
+    - "--mem=512m"
+    - "--nodes=1"
+    - "--ntasks=1"
+    - "--cpus-per-task=1"
+    - "--partition=<%= SiteConfig.student_lookup_partition %>"
+    # <% else %>
+    - "--mem=<%= tier.mem_gb %>g"
+    - "--nodes=1"
+    - "--ntasks=1"
+    - "--cpus-per-task=<%= tier.cpus %>"
+    - "--partition=gpu"
+    - "--gres=gpu:1"
+    - "--constraint=<%= tier.constraint %>"
+    # <% end %>

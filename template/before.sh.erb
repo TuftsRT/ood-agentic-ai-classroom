@@ -1,0 +1,1260 @@
+#! /bin/bash
+# `__dir__` is unreliable here -- before.sh.erb/script.sh.erb are rendered by
+# OOD's generic render_erb_files, which calls ERB#result without setting
+# erb.filename, so __dir__ resolves to "." instead of this app's directory.
+# `session.app.root` is the app's real source directory in this context.
+# <% app_root = session.app.root %>
+# <% load File.join(app_root, "lib/site_config.rb") %>
+# <% load File.join(app_root, "lib/class_tiers.rb") %>
+# <% load File.join(app_root, "lib/course_storage.rb") %>
+# <% is_student = context.role_select.to_s == "student" %>
+export output_log="<%= session.staged_root.join('output.log') %>"
+export role="<%= is_student ? 'student' : 'faculty' %>"
+export storage_root="<%= SiteConfig.storage_root %>"
+export connection_host_suffix="<%= SiteConfig.connection_host_suffix %>"
+# <% if is_student %>
+
+# Student role: a tiny, GPU-free lookup job, not a model session. Re-derives
+# and re-validates the chosen course here, under the submitting student's
+# own real identity, rather than trusting the dropdown value as-is -- same
+# reasoning as the course_group re-check in the Faculty branch below (a
+# client could POST any value here, bypassing the dropdown entirely).
+raw_course_group="$(cat <<'OOD_STUDENT_COURSE_GROUP_EOF'
+<%= context.course_select_student.to_s.strip %>
+OOD_STUDENT_COURSE_GROUP_EOF
+)"
+case "$raw_course_group" in
+  *[!A-Za-z0-9_-]*)
+    echo "WARNING: course '$raw_course_group' contains unexpected characters; ignoring." >&2
+    raw_course_group=""
+    ;;
+esac
+course_group=""
+if [ -n "$raw_course_group" ] && [ "$raw_course_group" != "<%= CourseStorage::OTHER_VALUE %>" ]; then
+  if id -Gn | tr ' ' '\n' | grep -qx "$raw_course_group"; then
+    course_group="$raw_course_group"
+  else
+    echo "WARNING: you are not a member of the '$raw_course_group' storage group; can't look up that course." >&2
+  fi
+fi
+export course_group
+
+# script.sh.erb refreshes this file periodically with whatever it last
+# discovered (session found/not found, host/port, your own key) -- declared
+# as a conn_param (see submit.yml.erb) so view.html.erb re-reads it fresh on
+# every page load/poll, the same pattern this app already uses for
+# roster.csv/guardrails.txt on the Faculty side.
+status_path="<%= session.staged_root %>/session_status.json"
+( umask 077; printf '%s\n' '{"checked": false}' > "$status_path" )
+export status_path
+# <% else %>
+# <% tier = ClassTiers.fetch(context.class_size) %>
+export tier_key="<%= tier.key %>"
+export tier_label="<%= tier.label %>"
+export model_label="<%= tier.model_label %>"
+export model_file="<%= tier.model_file %>"
+export mmproj_file="<%= tier.mmproj_file %>"
+export num_slots="<%= tier.slots %>"
+export ctx_per_slot="<%= tier.ctx_per_slot %>"
+export batch_size="<%= tier.batch_size %>"
+export ubatch_size="<%= tier.ubatch_size %>"
+export sandbox_llm="<%= context.sandbox_llm %>"
+export prompt_caching="<%= context.prompt_caching %>"
+port="$(find_port)"
+export port
+
+# Course label: read back from a quoted heredoc instead of being interpolated
+# into a double-quoted string, so a `$()`/backtick typed into the "Course /
+# Session Label" field is inert text, never shell-executed.
+course_name="$(cat <<'OOD_COURSE_LABEL_EOF'
+<%= context.course_name.to_s.strip %>
+OOD_COURSE_LABEL_EOF
+)"
+[ -z "$course_name" ] && course_name="Untitled session"
+export course_name
+
+# Guardrails: the two checkboxes below are fixed, instructor-chosen booleans
+# ("1"/"0" from the widget itself, never free text), so interpolating them
+# directly into a shell `=` test carries no injection risk -- only the
+# "Other guardrails" free-text field needs the quoted-heredoc treatment (same
+# pattern as course_name above) so a `$()`/backtick typed into it is inert
+# text, never shell-executed. This whole file is a classroom-norms notice
+# shown on the connection page, not a technical restriction on the model --
+# students talk directly to llama-server, so there is no proxy layer here
+# that could intercept and enforce it server-side.
+guardrails_path="<%= session.staged_root %>/guardrails.txt"
+guardrails_lines=()
+<% if context.guardrail_coursework.to_s == "1" %>
+guardrails_lines+=("Do not discuss or assist with this course's homework assignments, problem sets, or exam content.")
+<% end %>
+<% if context.guardrail_sensitive.to_s == "1" %>
+guardrails_lines+=("Do not engage with sensitive topics, including cybersecurity work (e.g. writing exploits/malware or attacking systems).")
+<% end %>
+extra_guardrails="$(cat <<'OOD_GUARDRAILS_EOF'
+<%= context.guardrails.to_s.strip %>
+OOD_GUARDRAILS_EOF
+)"
+[ -n "$extra_guardrails" ] && guardrails_lines+=("$extra_guardrails")
+printf '%s\n\n' "${guardrails_lines[@]}" > "$guardrails_path"
+export guardrails_path
+
+# Reference documents (optional RAG feature): same quoted-heredoc pattern as
+# course_name/guardrails above, so a path containing `$()`/backticks is inert
+# text, never shell-executed. Validated with `test -d` below (not here, where
+# we're still just reading form data back) -- an instructor who typed garbage
+# or a path that no longer exists should silently disable the feature rather
+# than fail the whole job, since every other option on this form is optional
+# too.
+reference_docs_dir="$(cat <<'OOD_REFERENCE_DOCS_DIR_EOF'
+<%= context.reference_docs_dir.to_s.strip %>
+OOD_REFERENCE_DOCS_DIR_EOF
+)"
+if [ -n "$reference_docs_dir" ] && [ ! -d "$reference_docs_dir" ]; then
+  echo "WARNING: reference_docs_dir '$reference_docs_dir' is not a directory; disabling the reference-documents feature for this session." >&2
+  reference_docs_dir=""
+fi
+# A colon would break the `src:dst:ro` syntax of the `--bind` flag this path
+# is later passed to in script.sh.erb (apptainer parses on literal `:`), with
+# undefined effect on what actually gets mounted -- reject outright rather
+# than silently bind something other than what the instructor intended.
+case "$reference_docs_dir" in
+  *:*)
+    echo "WARNING: reference_docs_dir '$reference_docs_dir' contains a ':', which is not supported; disabling the reference-documents feature for this session." >&2
+    reference_docs_dir=""
+    ;;
+esac
+export reference_docs_dir
+
+# Embedding model this app bootstraps for itself (see download-embedding-model.sh)
+# -- same nomic-embed-text-v1.5 GGUF rag-sandbox already validated, always
+# CPU-served regardless of class tier (see script.sh.erb). session.app.root
+# (not __dir__, unreliable here -- see note at the top of this file) is this
+# app's real source directory, so the path is correct regardless of where
+# Batch Connect stages the rendered copy of this script.
+export rag_embed_model_file="<%= File.join(session.app.root, 'models/embedding/nomic-embed-text-v1.5/nomic-embed-text-v1.5.Q8_0.gguf') %>"
+
+# Per-student API keys. The key file is never passed as a CLI argument (that
+# would make it readable via `ps`/`/proc` by any other user on the shared
+# compute node) -- script.sh.erb reads it back with --api-key-file. Same
+# pattern as llm_api/rag-sandbox/rustgis-agentic.
+key_dir="<%= session.staged_root %>/.llm-keys"
+if ! mkdir -p "$key_dir"; then
+  echo "ERROR: could not create $key_dir -- contact your system administrator." >&2
+  exit 1
+fi
+chmod 700 "$key_dir"
+key_file="$key_dir/api.keys"
+( umask 077; : > "$key_file" )
+export key_file
+
+roster_csv="<%= session.staged_root %>/roster.csv"
+( umask 077; echo "name,api_key" > "$roster_csv" )
+export roster_csv
+
+NUM_SLOTS=<%= tier.slots %>
+student_count=0
+
+# course_group rides in on a hidden form field that the course dropdown's own
+# JavaScript sets when an auto-detected course is picked (see
+# course_storage.rb/form.yml.erb) -- nothing stops a client from POSTing an
+# arbitrary value there directly, bypassing the dropdown entirely, so it's
+# never trusted as-is. Re-run the same check form.yml.erb used to decide
+# which courses this user is even allowed to see (membership in
+# "<group>admin") here, on the node actually running this job, under the
+# user's own real identity, before honoring it.
+course_group="$(cat <<'OOD_COURSE_GROUP_EOF'
+<%= context.course_group.to_s.strip %>
+OOD_COURSE_GROUP_EOF
+)"
+case "$course_group" in
+  *[!A-Za-z0-9_-]*)
+    echo "WARNING: course_group '$course_group' contains unexpected characters; falling back to the manual roster." >&2
+    course_group=""
+    ;;
+esac
+admin_group_suffix="<%= SiteConfig.admin_group_suffix %>"
+if [ -n "$course_group" ] && ! id -Gn | tr ' ' '\n' | grep -qx "${course_group}${admin_group_suffix}"; then
+  echo "WARNING: you are not a member of '${course_group}${admin_group_suffix}'; falling back to the manual roster." >&2
+  course_group=""
+fi
+# before.sh.erb and script.sh.erb are separate scripts/processes, not one
+# continuous shell -- only exported variables cross that boundary (seen the
+# hard way: course_group was readable here and still "unbound" in
+# script.sh.erb until this export was added). script.sh.erb's own Faculty
+# branch reads this to chgrp the shared session files/directory below.
+export course_group
+
+# Shared, student-discoverable connection info -- distinct from the private
+# roster.csv/key_file above, which live under this instructor's own OOD
+# session directory (unreadable by anyone else, including enrolled
+# students). Published instead into the course's own storage directory,
+# since every enrolled student is already a member of that storage's base
+# group ("$course_group" itself -- the admin-group check above only ever
+# passes for a group that is also a real base group, by construction, see
+# course_storage.rb).
+#
+# There is no POSIX ACL support on this cluster's NFS-mounted course
+# storage (confirmed directly: `setfacl` fails outright even on local
+# scratch space here), so a key file scoped to one specific student isn't
+# achievable with filesystem permissions alone -- the best available
+# boundary is "readable by the course's base group, not the world". Any
+# student in the course could read every classmate's key directly from
+# shared_keys_file if they went looking for it; the student-side connection
+# page (view.html.erb) only ever shows a student their own row. This widens
+# the same "keys aren't strongly protected within the class" tradeoff
+# SECURITY-OVERVIEW.md already documents for the Faculty-only roster.csv,
+# from "instructor-only" to "course-member-only" -- not a new category of
+# risk, a wider audience for an already-accepted one.
+shared_session_dir=""
+shared_session_file=""
+shared_keys_file=""
+if [ -n "$course_group" ]; then
+  shared_session_dir="$storage_root/$course_group/.llm-classroom-sandbox"
+  # $storage_root/$course_group is writable by the whole course base group
+  # (every enrolled student, not just admins -- see the admin-group check
+  # above), so any course member can race to create this subdirectory
+  # before we do. `mkdir` (no -p: the course storage root above it must
+  # already exist) under umask 027 makes a fresh directory mode 750 in one
+  # atomic step, with no window where it sits world/group-writable waiting
+  # for a later chmod. If it already exists we only ever reuse one we
+  # own -- never one some other course member created, however it's named
+  # or permissioned, since they could have pre-placed keys.csv/session.json
+  # as a symlink to capture every key written through it or redirect our
+  # writes elsewhere. "We own it" also covers the ordinary case this
+  # existed to handle: the same instructor's job restarting.
+  dir_ready=0
+  if ( umask 027; mkdir "$shared_session_dir" ) 2>/dev/null; then
+    dir_ready=1
+  elif [ -d "$shared_session_dir" ] && [ ! -L "$shared_session_dir" ] && [ -O "$shared_session_dir" ]; then
+    dir_ready=1
+  fi
+  if [ "$dir_ready" = 1 ]; then
+    chgrp "$course_group" "$shared_session_dir" 2>/dev/null || true
+    chmod 750 "$shared_session_dir"
+    # Sweeps away any *.tmp.$$ leftovers from a prior run's script.sh.erb
+    # crashing between writing its own temp file and renaming it into place
+    # (seen directly: an earlier, since-fixed bug did exactly this, orphaning
+    # a stray session.json.tmp.<pid> here that nothing else ever revisits).
+    # The overwrite below already makes session.json/keys.csv themselves
+    # self-healing; this does the same for any same-named debris they don't
+    # touch.
+    rm -f "$shared_session_dir"/*.tmp.* 2>/dev/null || true
+    shared_session_file="$shared_session_dir/session.json"
+    shared_keys_file="$shared_session_dir/keys.csv"
+    # Belt-and-suspenders against a symlink predating this fix (or this
+    # directory's ownership confirmation above): never follow one on write.
+    [ -L "$shared_keys_file" ] && rm -f "$shared_keys_file"
+    [ -L "$shared_session_file" ] && rm -f "$shared_session_file"
+    ( umask 027; : > "$shared_keys_file" )
+    chgrp "$course_group" "$shared_keys_file" 2>/dev/null || true
+    chmod 640 "$shared_keys_file"
+    # Overwrites whatever a previous (including crashed/never-cleaned-up)
+    # session for this course left behind -- self-healing by construction,
+    # no separate "is this stale?" check needed. script.sh.erb's cleanup()
+    # trap removes this directory entirely once this job ends normally; this
+    # overwrite is the backstop for a run that never reached that trap (e.g.
+    # node failure).
+    json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n'; }
+    cat > "$shared_session_file" <<EOF
+{"course_name": "$(json_escape "$course_name")", "tier_label": "$(json_escape "$tier_label")", "model_label": "$(json_escape "$model_label")", "job_id": "${SLURM_JOB_ID:-}", "host": "", "port": $port, "status": "starting"}
+EOF
+    chgrp "$course_group" "$shared_session_file" 2>/dev/null || true
+    chmod 640 "$shared_session_file"
+  else
+    echo "WARNING: could not safely publish to $shared_session_dir -- it already exists and isn't ours (course_group may not be a real storage directory, its permissions may deny write access, or another course member may have pre-created it); students won't be able to auto-discover this session. If this persists, ask your system administrator to remove the directory." >&2
+    shared_session_dir=""
+  fi
+fi
+export shared_session_dir
+export shared_session_file
+export shared_keys_file
+
+# roster_entries is one "username<TAB>display_name" per line (username empty
+# for manually-typed roster entries, which have no associated system
+# account -- shared_keys_file above is only ever populated for the
+# course_group-sourced case below). Fed into the same key-issuing loop below
+# either way -- from the course's storage group when one was validated
+# above, or (also used as the fallback if that group turns out to have zero
+# members) from the manual roster textarea.
+roster_entries=""
+if [ -n "$course_group" ]; then
+  if getent group "$course_group" >/dev/null 2>&1; then
+    echo "Deriving the student roster from the '$course_group' storage group..."
+    roster_entries="$(getent group "$course_group" | cut -d: -f4 | tr ',' '\n' | sort | while IFS= read -r username; do
+      [ -z "$username" ] && continue
+      full_name="$(getent passwd "$username" 2>/dev/null | awk -F: '{print $5}' | cut -d',' -f1)"
+      printf '%s\t%s\n' "$username" "${full_name:-$username}"
+    done)"
+  else
+    echo "WARNING: course_group '$course_group' passed its admin check but has no matching system group; falling back to the manual roster." >&2
+  fi
+fi
+if [ -z "$roster_entries" ]; then
+  # The roster textarea is pasted in verbatim below and read back line-by-line
+  # via a quoted heredoc -- same reasoning as course_name: it is data, never
+  # shell-interpreted, no matter what a student's name/username contains.
+  # Tab-prefixed (empty username field) so the loop below can read both
+  # sources with the same `IFS=$'\t' read -r username name` pattern.
+  roster_entries="$(cat <<'OOD_ROSTER_EOF_7F3A9C21'
+<%= context.roster.to_s.gsub("\r\n", "\n").strip %>
+OOD_ROSTER_EOF_7F3A9C21
+)"
+  roster_entries="$(printf '%s\n' "$roster_entries" | sed 's/^/\t/')"
+fi
+
+# Fed via process substitution (not a pipe) so this loop runs in the current
+# shell, not a subshell -- a pipe here would silently reset student_count to
+# 0 once the loop exits, breaking the "no roster -> anonymous slots" check
+# below. $roster_entries is passed as a single quoted argument to printf, so
+# nothing in it (from either source above) is re-interpreted as shell syntax.
+while IFS=$'\t' read -r username raw_name; do
+  name="$(printf '%s' "$raw_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [ -z "$name" ] && continue
+  if [ "$student_count" -ge "$NUM_SLOTS" ]; then
+    echo "WARNING: roster has more entries than this tier's $NUM_SLOTS slots; ignoring the rest." >&2
+    break
+  fi
+  key="$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 32)"
+  printf '%s\n' "$key" >> "$key_file"
+  # CSV/formula-injection guard (CWE-1236): a roster name starting with
+  # =, +, -, or @ would be interpreted as a formula by Excel/Sheets when the
+  # instructor opens roster.csv -- prefix a single quote to force text.
+  case "$name" in
+    [=+@-]*) name="'$name" ;;
+  esac
+  name_csv="${name//\"/\"\"}"
+  printf '"%s",%s\n' "$name_csv" "$key" >> "$roster_csv"
+  # $username is only ever a real system login name (from `getent passwd`
+  # above), never free text -- unlike $name, it needs no CSV escaping here.
+  if [ -n "$username" ] && [ -n "$shared_keys_file" ]; then
+    printf '%s,%s\n' "$username" "$key" >> "$shared_keys_file"
+  fi
+  student_count=$((student_count + 1))
+done < <(printf '%s\n' "$roster_entries")
+
+if [ "$student_count" -eq 0 ]; then
+  for slot in $(seq 1 "$NUM_SLOTS"); do
+    key="$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 32)"
+    printf '%s\n' "$key" >> "$key_file"
+    printf '"Slot %s",%s\n' "$slot" "$key" >> "$roster_csv"
+  done
+fi
+
+chmod 600 "$key_file" "$roster_csv"
+
+# MCP tools server script (web_search + literature_search), written out
+# here directly rather than cp'd from the app's own files/ dir: before.sh.erb/
+# script.sh.erb are confirmed fresh on every single submission throughout
+# this app's development, but a plain file under files/ copied via
+# session.app.root depends on OOD's dev-mode "gateway" mirror of this app
+# being in sync, which doesn't seem to happen as reliably or immediately --
+# a real failure seen in testing (0 tools discovered because the source
+# file didn't exist yet at that path). Heredoc is quoted so none of the
+# script's own $-syntax (f-strings use {var}, not ${var}, but there's no
+# reason to rely on that) gets touched by this shell.
+mcp_tools_script="<%= session.staged_root %>/mcp_tools.py"
+cat > "$mcp_tools_script" <<'OOD_MCP_TOOLS_PY_EOF'
+#!/usr/bin/env python3
+"""
+Minimal stdio MCP server exposing two tools, "web_search" (backed by a
+local SearXNG instance, see script.sh.erb) and "literature_search" (backed
+by the Semantic Scholar Graph API, a free, keyless, public academic search
+API -- unlike SearXNG this one is a real remote call over the internet, not
+loopback). Implements only the subset of the MCP JSON-RPC protocol
+llama-server's --mcp-servers-config needs: initialize, tools/list,
+tools/call.
+
+Standard-library only, deliberately: llama-server spawns this as its own
+child process *inside* the same llama-server-gpu.sif container it runs in
+(MCP stdio servers inherit the parent's mount namespace), which is a minimal
+image built for inference, not a general Python environment we control the
+installed packages of. No pip dependencies means nothing extra has to exist
+in that container beyond python3 itself.
+"""
+import json
+import os
+import signal
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SEARXNG_PORT = os.environ.get("SEARXNG_PORT", "")
+SEARXNG_URL = f"http://127.0.0.1:{SEARXNG_PORT}/search"
+SEMANTIC_SCHOLAR_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+SEMANTIC_SCHOLAR_FIELDS = (
+    "title,authors,year,venue,abstract,citationCount,isOpenAccess,openAccessPdf,externalIds"
+)
+
+# Each MCP tool call is a brand-new, stateless subprocess (llama-server
+# respawns this script per call, see the module docstring) -- there is no
+# in-memory state to track "called N times in the last minute" across calls.
+# A flat minimum delay, applied unconditionally inside every call, is the
+# simplest thing that reliably prevents a rapid-fire tool-call loop
+# regardless of why the model keeps re-invoking it: testing showed exactly
+# this happening (6 tool-call round-trips 1.5-3 seconds apart in a row).
+# Shared across both tools -- the problem this guards against isn't
+# specific to either one.
+MIN_CALL_SECONDS = 3.0
+# Unconditional hard ceiling on any single tool call, independent of that
+# tool's own internal retry/timeout logic: a web_search call hung for
+# minutes in testing despite its own timeouts, blocking the whole server
+# waiting on one call. Whatever the actual cause, this guarantees a
+# response within ~18s no matter what -- a wrong/slow answer is
+# recoverable, a hung server isn't. 18s comfortably covers the worst case
+# of either tool's own per-request_timeout + backoff + per_request_timeout
+# (8+2+8=18) while staying under llama-server's own 20s MCP timeout_ms.
+HARD_TIMEOUT_SECONDS = 18
+
+TOOLS = {}
+
+
+def _register(definition):
+    def decorator(func):
+        TOOLS[definition["name"]] = {"definition": definition, "handler": func}
+        return func
+
+    return decorator
+
+
+def _truncate(text, limit=200):
+    text = text or ""
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+def _paced(start):
+    # Always take at least MIN_CALL_SECONDS end to end, success or failure,
+    # so a model that immediately calls a tool again can't do so faster
+    # than that floor -- see the MIN_CALL_SECONDS comment above.
+    elapsed = time.monotonic() - start
+    if elapsed < MIN_CALL_SECONDS:
+        time.sleep(MIN_CALL_SECONDS - elapsed)
+
+
+class _Watchdog(Exception):
+    pass
+
+
+def _raise_watchdog(signum, frame):
+    raise _Watchdog("tool call exceeded its hard time limit")
+
+
+@_register({
+    "name": "web_search",
+    "description": (
+        "Search the web for current information. Returns the top results "
+        "(title, URL, snippet). Slow and rate-limited by design -- call it "
+        "at most once per question. If it errors or returns nothing useful, "
+        "do not call it again for the same question; tell the user you "
+        "could not find anything rather than retrying."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The search query."}
+        },
+        "required": ["query"],
+    },
+})
+def web_search(query, max_results=3, retries=1, backoff_seconds=2.0, per_request_timeout=8):
+    # Keep results small: each search call eats into the student's slot
+    # context budget (ctx_per_slot is as low as 4096 on some tiers), and a
+    # multi-turn conversation with a few search calls can burn through that
+    # fast if results aren't trimmed.
+    #
+    # One retry (not the two this started with): each retry is itself
+    # another rapid-fire request to already-fragile upstream engines, which
+    # works against the rate-limiting problem more than it helps -- better
+    # to fail fast and let MIN_CALL_SECONDS set the actual pace.
+    #
+    # per_request_timeout=8 (down from 15): a session hung for minutes
+    # waiting on this tool in testing, well past any of these bounds, which
+    # means something can block longer than urllib's own timeout accounts
+    # for. The signal-alarm watchdog in handle() below is the real,
+    # unconditional backstop against hanging regardless of what actually
+    # went wrong.
+    start = time.monotonic()
+    qs = urllib.parse.urlencode({"q": query, "format": "json"})
+    url = f"{SEARXNG_URL}?{qs}"
+    last_exc = None
+    result = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=per_request_timeout) as resp:
+                data = json.load(resp)
+            results = data.get("results", [])[:max_results]
+            result = (
+                "No results found."
+                if not results
+                else "\n".join(
+                    f"- {r.get('title', '(no title)')}\n  {r.get('url', '')}\n  {_truncate(r.get('content', ''))}"
+                    for r in results
+                )
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff_seconds * (attempt + 1))
+    if result is None:
+        result = f"web_search error after {retries + 1} attempt(s): {last_exc}"
+    _paced(start)
+    return result
+
+
+def _format_paper(p):
+    title = p.get("title") or "(no title)"
+    authors = [a.get("name", "") for a in (p.get("authors") or []) if a.get("name")]
+    author_str = ", ".join(authors[:5]) + (", et al." if len(authors) > 5 else "")
+    author_str = author_str or "(unknown authors)"
+    venue = p.get("venue") or "(unknown venue)"
+    year = p.get("year") or "?"
+    citations = p.get("citationCount")
+    citation_str = f"{citations} citations" if citations is not None else "citation count unknown"
+    ext = p.get("externalIds") or {}
+    ids = [f"{k}:{ext[k]}" for k in ("DOI", "ArXiv") if ext.get(k)]
+    id_str = f" ({', '.join(ids)})" if ids else ""
+    oa = p.get("openAccessPdf") or {}
+    if p.get("isOpenAccess") and oa.get("url"):
+        access_line = f"Open-access PDF: {oa['url']}"
+    else:
+        access_line = "No legally open-access PDF found through this source -- check your institution's access."
+    abstract = _truncate(p.get("abstract") or "(no abstract available)", limit=300)
+    return "\n".join([
+        f"- {title}{id_str}",
+        f"  {author_str} -- {venue}, {year} -- {citation_str}",
+        f"  {access_line}",
+        f"  {abstract}",
+    ])
+
+
+@_register({
+    "name": "literature_search",
+    "description": (
+        "Search academic literature (papers across all fields, via Semantic "
+        "Scholar's public catalog) for a topic or question. Returns title, "
+        "authors, year, venue, citation count, a short abstract excerpt, "
+        "and a link to an open-access PDF when one is legally available -- "
+        "not every result will have one. Slow and rate-limited by design -- "
+        "call it at most once per question. If it errors or returns nothing "
+        "useful, do not call it again for the same question; tell the user "
+        "you could not find anything rather than retrying."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The topic, question, or keywords to search academic literature for.",
+            }
+        },
+        "required": ["query"],
+    },
+})
+def literature_search(query, max_results=3, retries=1, backoff_seconds=2.0, per_request_timeout=8):
+    # Unlike web_search, this is a real call over the open internet to a
+    # third-party API, not a loopback call to a container this job itself
+    # launched -- same category of egress the SearXNG-backed web_search
+    # already requires, not a new kind of exposure, but worth naming since
+    # it means query text leaves the cluster (see SECURITY-OVERVIEW.md).
+    # No API key: Semantic Scholar's search endpoint works anonymously at
+    # low volume; a classroom hammering it concurrently could start seeing
+    # 429s under their shared anonymous rate limit, same "degrades to an
+    # error for that one request" story as web_search under load.
+    start = time.monotonic()
+    qs = urllib.parse.urlencode({
+        "query": query,
+        "limit": max_results,
+        "fields": SEMANTIC_SCHOLAR_FIELDS,
+    })
+    url = f"{SEMANTIC_SCHOLAR_URL}?{qs}"
+    last_exc = None
+    result = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "llm-classroom-sandbox/1.0 (Tufts HPC educational use)"},
+            )
+            with urllib.request.urlopen(req, timeout=per_request_timeout) as resp:
+                data = json.load(resp)
+            papers = (data.get("data") or [])[:max_results]
+            result = (
+                "No results found."
+                if not papers
+                else "\n\n".join(_format_paper(p) for p in papers)
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff_seconds * (attempt + 1))
+    if result is None:
+        result = f"literature_search error after {retries + 1} attempt(s): {last_exc}"
+    _paced(start)
+    return result
+
+
+def handle(req):
+    method = req.get("method")
+    req_id = req.get("id")
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "classroom-tools-mcp", "version": "1.0.0"},
+            },
+        }
+    if method == "notifications/initialized":
+        return None
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": [t["definition"] for t in TOOLS.values()]},
+        }
+    if method == "tools/call":
+        params = req.get("params", {})
+        name = params.get("name")
+        tool = TOOLS.get(name)
+        if tool is None:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": f"Unknown tool: {name}"},
+            }
+        query = params.get("arguments", {}).get("query", "")
+        old_handler = signal.signal(signal.SIGALRM, _raise_watchdog)
+        signal.alarm(HARD_TIMEOUT_SECONDS)
+        try:
+            text = tool["handler"](query)
+        except _Watchdog:
+            text = f"{name} error: timed out"
+        except Exception as exc:  # network/upstream failure shouldn't crash the server
+            text = f"{name} error: {exc}"
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": text}]},
+        }
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        resp = handle(req)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
+OOD_MCP_TOOLS_PY_EOF
+chmod 644 "$mcp_tools_script"
+export mcp_tools_script
+
+# Reference-documents index server (RAG feature, optional -- see
+# reference_docs_dir above). Written out unconditionally, same reasoning as
+# mcp_tools.py above (.erb templates confirmed fresh every submission;
+# a files/ copy isn't as reliable in dev-mode); script.sh.erb only ever
+# *launches* it when reference_docs_dir is actually set. Stdlib-only Python,
+# same constraint as mcp_tools.py: this runs inside
+# llama-server-gpu.sif, a minimal image built for inference, not a general
+# Python environment -- confirmed no numpy/scikit-learn/PDF libraries
+# available there, so TF-IDF and cosine similarity are hand-rolled here in
+# plain Python rather than assuming numpy exists. That's fine at classroom
+# scale (a instructor's own reading list, not a research corpus) -- a query
+# against a few hundred chunks scores in well under a second.
+rag_index_script="<%= session.staged_root %>/rag_index_server.py"
+cat > "$rag_index_script" <<'OOD_RAG_INDEX_PY_EOF'
+#!/usr/bin/env python3
+"""
+Loopback-only HTTP service that pre-indexes an instructor-provided folder of
+reference documents once at session start (before serving any requests),
+then answers hybrid TF-IDF + neural-embedding retrieval queries for
+guardrails_proxy.py to splice into every chat request. One shared index for
+the whole class session, built once -- not per-student, not per-request.
+
+Supports plain text/Markdown/code, Word (.docx), PowerPoint (.pptx), and a
+best-effort attempt at PDF -- all with pure-stdlib parsing (zipfile/XML for
+the Office formats, zlib + regex content-stream parsing for PDF), since this
+environment has none of numpy/scikit-learn/pypdf/python-docx/etc installed
+and no internet access to fetch them at runtime. Legacy binary .doc/.ppt are
+NOT supported (a different, much harder-to-parse format than modern
+zip/XML-based .docx/.pptx) and are skipped like any other unrecognized
+extension. The PDF extractor specifically only handles simple, non-scanned,
+standard-encoded text -- see extract_pdf_text()'s docstring for exactly what
+it can't do. Every extractor is wrapped so a single malformed/unusual file
+can only ever remove that one file from the index, never abort indexing for
+the rest of the corpus or crash this process.
+
+Usage: rag_index_server.py <listen_port> <docs_dir> <embed_server_port>
+"""
+import http.server
+import json
+import math
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
+import zlib
+
+LISTEN_PORT = int(sys.argv[1])
+DOCS_DIR = sys.argv[2]
+EMBED_PORT = int(sys.argv[3])
+EMBED_URL = f"http://127.0.0.1:{EMBED_PORT}/v1/embeddings"
+
+# Word counts, not tokens -- no tokenizer is available in this environment
+# (see module docstring), and an approximate chunk size is good enough for
+# this feature's purpose.
+CHUNK_WORDS = 300
+OVERLAP_WORDS = 40
+TOP_K = 3
+# Weighted sum, not reciprocal-rank fusion -- both cosine similarities are
+# already bounded roughly to [0, 1], so a weighted sum is simple and legible;
+# slightly favors the semantic (embedding) signal over exact lexical overlap.
+TFIDF_WEIGHT = 0.4
+EMBED_WEIGHT = 0.6
+EMBED_BATCH_SIZE = 16
+# Fixed name of this app's own shared, student-discoverable session
+# directory (see before.sh.erb's Faculty branch / SECURITY-OVERVIEW.md's
+# "Faculty/Student roles" section) -- it holds keys.csv (per-student API
+# keys) and session.json, created directly under the course storage root
+# (a *sibling* of the dedicated subdirectory a known course's
+# reference_docs_dir auto-fills to now, course_storage.rb's
+# REFERENCE_DOCS_SUBDIR/select_options -- the walk below no longer reaches
+# it by default at all). Named explicitly here anyway, as defense in depth
+# for the case this skip exists to cover: an instructor who manually pastes
+# the course storage root itself into reference_docs_dir, where this skip
+# is the only thing stopping keys.csv/session.json from being walked. Not
+# left to the generic dot-prefix skip below alone: that skip only prunes
+# *subdirectories encountered while walking*, which doesn't cover
+# reference_docs_dir being pointed directly at this directory itself, and
+# both ".csv"/".json" are on this indexer's own allowed-extensions list, so
+# nothing else here would otherwise stop keys.csv from being indexed and
+# handed to the model as retrieval context if that skip were ever bypassed
+# or changed.
+SHARED_SESSION_DIR_NAME = ".llm-classroom-sandbox"
+PLAIN_TEXT_EXTENSIONS = {
+    "", ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json",
+    ".yaml", ".yml", ".py", ".js", ".ts", ".java", ".c", ".cc", ".cpp",
+    ".h", ".hpp", ".sh", ".r", ".tex", ".log", ".ini", ".cfg", ".toml",
+}
+# Modern, zip/XML-based Office formats only -- NOT legacy binary .doc/.ppt,
+# a completely different (OLE Compound File) format this does not parse.
+OFFICE_EXTENSIONS = {".docx", ".pptx"}
+PDF_EXTENSIONS = {".pdf"}
+ALLOWED_EXTENSIONS = PLAIN_TEXT_EXTENSIONS | OFFICE_EXTENSIONS | PDF_EXTENSIONS
+MAX_FILE_BYTES = 20_000_000
+# PDF content streams containing embedded images/fonts can be large and are
+# never useful to this text-only extractor; skipping zlib-decompression of
+# anything bigger than this keeps a single image-heavy PDF from dominating
+# indexing time. Genuine text content streams are virtually always much
+# smaller than this even for a long document.
+MAX_PDF_STREAM_BYTES = 2_000_000
+# Caps total decompressed/extracted bytes pulled from within any ONE
+# instructor-supplied file, regardless of how that total is spread across
+# zip members (.docx/.pptx) or PDF content streams. This is a different,
+# more important guarantee than MAX_FILE_BYTES above: MAX_FILE_BYTES only
+# bounds the file's own on-disk size, but zip and zlib compression both
+# allow a tiny file to decompress into gigabytes ("zip/decompression
+# bombs") -- a small, otherwise-ordinary-looking .docx or .pdf could
+# otherwise exhaust this process's memory during indexing. Generous enough
+# that no genuine course document should ever hit it.
+MAX_EXTRACTED_BYTES_PER_FILE = 20_000_000
+WORD_RE = re.compile(r"[A-Za-z0-9']+")
+
+_chunks = []  # [{"source","text","tfidf","tfidf_norm","embedding","embedding_norm"}]
+_idf = {}
+
+
+class _ByteBudgetExceeded(Exception):
+    pass
+
+
+class _BoundedReader:
+    """Wraps a file-like object; raises once more than `budget[0]` bytes
+    have been read through it in total (`budget` is a shared, mutable
+    single-item list so several readers -- e.g. one per slide in a .pptx --
+    can share one running total). This is the actual guard against zip/
+    decompression bombs: it counts bytes as they're actually produced,
+    never trusting a zip member's own declared/claimed size, which a
+    maliciously crafted file can simply lie about."""
+
+    def __init__(self, fileobj, budget):
+        self._fileobj = fileobj
+        self._budget = budget
+
+    def read(self, size=-1):
+        if self._budget[0] <= 0:
+            raise _ByteBudgetExceeded("extraction byte budget exhausted")
+        request = self._budget[0] if size is None or size < 0 else min(size, self._budget[0])
+        chunk = self._fileobj.read(request)
+        self._budget[0] -= len(chunk)
+        return chunk
+
+
+def _parse_xml_safely(fileobj):
+    # xml.etree.ElementTree is explicitly documented as NOT safe against
+    # maliciously constructed XML (billion-laughs entity expansion, and XXE
+    # if external entities were allowed) -- there's no defusedxml available
+    # here (no internet access to install it at runtime). Legitimate OOXML
+    # parts (word/document.xml, ppt/slides/slideN.xml) never contain a
+    # DOCTYPE, which is the only way either attack can be expressed in XML,
+    # so a raw scan for one before parsing blocks both. Deliberately not
+    # reaching into ElementTree's own parser internals to hook this instead
+    # (e.g. a custom expat callback) -- CPython uses a C-accelerated
+    # XMLParser by default that doesn't expose the same attributes the
+    # pure-Python fallback implementation does, so that approach is not
+    # portable across Python builds the way this plain byte check is.
+    # `fileobj` is already wrapped in _BoundedReader by every caller, so
+    # reading it whole here is still bounded by that budget, not unbounded.
+    data = fileobj.read()
+    if b"<!DOCTYPE" in data:
+        raise ValueError("DOCTYPE declarations are not allowed in OOXML parts")
+    return ET.fromstring(data)
+
+
+def log(msg):
+    print(f"[rag_index] {msg}", file=sys.stderr, flush=True)
+
+
+def iter_candidate_files(root):
+    # Refuses outright if reference_docs_dir was pointed directly at this
+    # app's own shared session directory -- the dirnames-pruning skip below
+    # only ever protects it as a *subdirectory* encountered partway through
+    # the walk, not as the walk's own root (os.walk never re-checks its
+    # starting path the same way). See SHARED_SESSION_DIR_NAME's own comment
+    # for why this is named explicitly rather than left to the dot-prefix
+    # convention alone.
+    if os.path.basename(os.path.normpath(root)) == SHARED_SESSION_DIR_NAME:
+        log(f"refusing to index {root}: this is the app's own shared-session directory (API keys), not course material")
+        return
+    # Skip symlinks (both directories to descend into and individual files):
+    # reference_docs_dir is bind-mounted read-only, but a symlink inside it
+    # can still point anywhere else this job's own user can read -- silently
+    # following one would index and then broadcast that file's content to
+    # every student's chat session, well outside the folder the instructor
+    # actually chose.
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d != SHARED_SESSION_DIR_NAME
+            and not d.startswith(".")
+            and not os.path.islink(os.path.join(dirpath, d))
+        ]
+        for name in filenames:
+            if name.startswith("."):
+                continue
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in ALLOWED_EXTENSIONS:
+                continue
+            yield path
+
+
+def read_plain_text(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    return raw.decode("utf-8")
+
+
+_DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def extract_docx_text(path):
+    budget = [MAX_EXTRACTED_BYTES_PER_FILE]
+    with zipfile.ZipFile(path) as zf:
+        with zf.open("word/document.xml") as f:
+            root = _parse_xml_safely(_BoundedReader(f, budget))
+    paragraphs = []
+    for para in root.iter(f"{_DOCX_NS}p"):
+        line = "".join(node.text or "" for node in para.iter(f"{_DOCX_NS}t")).strip()
+        if line:
+            paragraphs.append(line)
+    return "\n".join(paragraphs)
+
+
+_PPTX_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_PPTX_SLIDE_RE = re.compile(r"ppt/slides/slide(\d+)\.xml$")
+# A zip's central directory can declare a huge number of (even empty)
+# entries well within MAX_FILE_BYTES -- bounding how many "slides" are ever
+# opened caps that cost explicitly, rather than relying only on the
+# indirect, much looser bound MAX_FILE_BYTES happens to imply.
+MAX_PPTX_SLIDES = 2000
+
+
+def extract_pptx_text(path):
+    # One shared budget across every slide, not one per slide: otherwise a
+    # deck with many slides, each individually under the cap, could still
+    # add up to an unbounded total (see MAX_EXTRACTED_BYTES_PER_FILE above).
+    budget = [MAX_EXTRACTED_BYTES_PER_FILE]
+    lines = []
+    with zipfile.ZipFile(path) as zf:
+        slides = [(m, n) for n in zf.namelist() if (m := _PPTX_SLIDE_RE.search(n))]
+        slides.sort(key=lambda pair: int(pair[0].group(1)))
+        if len(slides) > MAX_PPTX_SLIDES:
+            log(f"{path}: {len(slides)} slide entries found, only processing the first {MAX_PPTX_SLIDES}")
+            slides = slides[:MAX_PPTX_SLIDES]
+        for _, name in slides:
+            try:
+                with zf.open(name) as f:
+                    root = _parse_xml_safely(_BoundedReader(f, budget))
+            except _ByteBudgetExceeded:
+                log(f"{path}: hit the per-file extraction budget partway through -- keeping the slides read so far, dropping the rest")
+                break
+            for node in root.iter(f"{_PPTX_NS}t"):
+                if node.text and node.text.strip():
+                    lines.append(node.text.strip())
+    return "\n".join(lines)
+
+
+# --- Best-effort, pure-stdlib PDF text extraction. ---
+#
+# This is NOT a real PDF parser (no object-graph/xref parsing, no font/
+# encoding tables, no CID/Type0 support) -- it's a pragmatic regex pass over
+# every `stream ... endstream` block, with Flate (zlib) decompression where
+# applicable, looking for text-showing operators (`Tj`/`TJ`) and decoding
+# their string operands under the assumption of a simple one-byte-per-
+# character encoding (WinAnsi/MacRoman-like). That assumption holds for most
+# plain text-based PDFs produced by Word/Google Docs/LaTeX with standard
+# fonts, which covers most of what an instructor would hand out. It does
+# NOT hold for: scanned/image-only PDFs (no text operators exist at all --
+# this needs OCR, which is out of scope here), and PDFs using embedded
+# subset/CID fonts with custom encodings (the bytes extracted won't map to
+# the right characters). _looks_like_text() below is the safety net for
+# both: if the result doesn't look like real text, the file is skipped
+# entirely rather than indexing garbage.
+_PDF_STREAM_RE = re.compile(rb"stream\r?\n(.*?)endstream", re.S)
+_PDF_SHOW_TEXT_RE = re.compile(r"\(((?:[^()\\]|\\.)*)\)\s*Tj|\[((?:[^\[\]])*)\]\s*TJ")
+_PDF_TJ_STRING_RE = re.compile(r"\(((?:[^()\\]|\\.)*)\)")
+_PDF_OCTAL_ESCAPE_RE = re.compile(r"\\([0-7]{1,3})")
+_PDF_SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "(": "(", ")": ")", "\\": "\\"}
+
+
+def _decode_pdf_literal_string(raw):
+    out = []
+    i, n = 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\\" and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt in _PDF_SIMPLE_ESCAPES:
+                out.append(_PDF_SIMPLE_ESCAPES[nxt])
+                i += 2
+                continue
+            if nxt == "\n":
+                i += 2  # line-continuation backslash, no output
+                continue
+            m = _PDF_OCTAL_ESCAPE_RE.match(raw, i)
+            if m:
+                out.append(chr(int(m.group(1), 8) & 0xFF))
+                i = m.end()
+                continue
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _extract_text_from_content_stream(data):
+    out = []
+    for m in _PDF_SHOW_TEXT_RE.finditer(data):
+        if m.group(1) is not None:
+            out.append(_decode_pdf_literal_string(m.group(1)))
+        elif m.group(2) is not None:
+            for s in _PDF_TJ_STRING_RE.finditer(m.group(2)):
+                out.append(_decode_pdf_literal_string(s.group(1)))
+    return "".join(out)
+
+
+def _looks_like_text(text):
+    stripped = text.strip()
+    if len(stripped) < 20:
+        return False
+    printable = sum(1 for c in stripped if c.isprintable() or c in "\n\r\t")
+    return printable / len(stripped) > 0.85
+
+
+def extract_pdf_text(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    chunks = []
+    total_extracted = 0
+    for m in _PDF_STREAM_RE.finditer(raw):
+        if total_extracted >= MAX_EXTRACTED_BYTES_PER_FILE:
+            log(f"{path}: hit the per-file extraction budget partway through -- keeping the text extracted so far, dropping the rest")
+            break
+        blob = m.group(1)
+        if len(blob) > MAX_PDF_STREAM_BYTES:
+            continue  # almost certainly an image/font stream, not text -- not worth decompressing
+        try:
+            # max_length bounds the DECOMPRESSED output regardless of the
+            # compressed size or ratio -- the actual guard against a stream
+            # deliberately crafted to inflate far beyond what its compressed
+            # size would suggest (a "zlib bomb"), not just a speed shortcut.
+            blob = zlib.decompressobj().decompress(blob, MAX_PDF_STREAM_BYTES)
+        except zlib.error:
+            pass  # not Flate-compressed -- try it as-is; harmless if it's actually an image/font stream
+        try:
+            text_blob = blob.decode("latin-1")
+        except UnicodeDecodeError:
+            continue
+        chunk = _extract_text_from_content_stream(text_blob)
+        if chunk.strip():
+            chunks.append(chunk)
+            total_extracted += len(chunk)
+    text = "\n".join(chunks)
+    if not _looks_like_text(text):
+        log(f"skipping {path}: extracted PDF text looks empty or garbled (scanned PDF, or a font encoding this lightweight extractor doesn't support)")
+        return None
+    return text
+
+
+def extract_text(path):
+    # Single entry point for every file this indexer reads. Every extractor
+    # above can raise on a malformed/unusual file of its own format (bad
+    # zip, malformed XML, unexpected PDF structure, etc.) -- caught broadly
+    # here, deliberately, so one bad file only ever drops itself out of the
+    # index instead of aborting indexing for the rest of the corpus or
+    # crashing this process.
+    try:
+        if os.path.getsize(path) > MAX_FILE_BYTES:
+            log(f"skipping {path}: larger than {MAX_FILE_BYTES} bytes")
+            return None
+    except OSError as exc:
+        log(f"skipping {path}: {exc}")
+        return None
+
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".docx":
+            return extract_docx_text(path)
+        if ext == ".pptx":
+            return extract_pptx_text(path)
+        if ext == ".pdf":
+            return extract_pdf_text(path)
+        return read_plain_text(path)
+    except (OSError, UnicodeDecodeError, zipfile.BadZipFile, ET.ParseError, KeyError, ValueError, _ByteBudgetExceeded) as exc:
+        log(f"skipping {path}: could not extract text ({type(exc).__name__}: {exc})")
+        return None
+    except Exception as exc:
+        # Last-resort catch-all: an extractor bug on a weird real-world file
+        # must never take down indexing for the rest of the session.
+        log(f"skipping {path}: unexpected error extracting text ({type(exc).__name__}: {exc})")
+        return None
+
+
+def chunk_text(text):
+    words = text.split()
+    if not words:
+        return []
+    step = CHUNK_WORDS - OVERLAP_WORDS
+    out = []
+    i = 0
+    while True:
+        out.append(" ".join(words[i:i + CHUNK_WORDS]))
+        if i + CHUNK_WORDS >= len(words):
+            break
+        i += step
+    return out
+
+
+def tokenize(text):
+    return [w.lower() for w in WORD_RE.findall(text)]
+
+
+def embed_batch(texts, prefix):
+    # nomic-embed-text requires a task-instruction prefix on every input --
+    # "search_document: " when indexing, "search_query: " when querying --
+    # or retrieval quality silently degrades (confirmed via the model's own
+    # documentation; this is not optional/cosmetic).
+    prefixed = [prefix + t for t in texts]
+    body = json.dumps({"input": prefixed}).encode("utf-8")
+    req = urllib.request.Request(
+        EMBED_URL, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        payload = json.load(resp)
+    items = sorted(payload["data"], key=lambda d: d["index"])
+    return [item["embedding"] for item in items]
+
+
+def build_index():
+    start = time.monotonic()
+    raw_chunks = []
+    for path in iter_candidate_files(DOCS_DIR):
+        text = extract_text(path)
+        if not text:
+            continue
+        rel = os.path.relpath(path, DOCS_DIR)
+        for piece in chunk_text(text):
+            if piece.strip():
+                raw_chunks.append((rel, piece))
+
+    if not raw_chunks:
+        log(f"no indexable text files found under {DOCS_DIR}")
+        return
+
+    doc_freq = {}
+    term_freqs = []
+    for _, text in raw_chunks:
+        terms = tokenize(text)
+        tf = {}
+        for t in terms:
+            tf[t] = tf.get(t, 0) + 1
+        term_freqs.append(tf)
+        for t in tf:
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+
+    n_docs = len(raw_chunks)
+    _idf.update({t: math.log(n_docs / (1 + df)) + 1 for t, df in doc_freq.items()})
+
+    texts = [text for _, text in raw_chunks]
+    embeddings = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i:i + EMBED_BATCH_SIZE]
+        try:
+            embeddings.extend(embed_batch(batch, "search_document: "))
+        except Exception as exc:
+            log(f"embedding batch failed ({exc}); those chunks fall back to TF-IDF-only matching")
+            embeddings.extend([[] for _ in batch])
+
+    for (source, text), tf, emb in zip(raw_chunks, term_freqs, embeddings):
+        tfidf = {t: c * _idf.get(t, 0.0) for t, c in tf.items()}
+        tfidf_norm = math.sqrt(sum(w * w for w in tfidf.values())) or 1.0
+        emb_norm = math.sqrt(sum(x * x for x in emb)) or 1.0
+        _chunks.append({
+            "source": source,
+            "text": text,
+            "tfidf": tfidf,
+            "tfidf_norm": tfidf_norm,
+            "embedding": emb,
+            "embedding_norm": emb_norm,
+        })
+
+    log(f"indexed {len(_chunks)} chunks from {len({s for s, _ in raw_chunks})} file(s) under {DOCS_DIR} in {time.monotonic() - start:.1f}s")
+
+
+def retrieve(query, top_k=TOP_K):
+    if not _chunks:
+        return []
+
+    tf = {}
+    for t in tokenize(query):
+        tf[t] = tf.get(t, 0) + 1
+    q_tfidf = {t: c * _idf.get(t, 0.0) for t, c in tf.items()}
+    q_norm = math.sqrt(sum(w * w for w in q_tfidf.values())) or 1.0
+
+    try:
+        q_emb = embed_batch([query], "search_query: ")[0]
+    except Exception as exc:
+        log(f"query embedding failed ({exc}); falling back to TF-IDF-only scoring")
+        q_emb = []
+    q_emb_norm = math.sqrt(sum(x * x for x in q_emb)) or 1.0
+
+    scored = []
+    for ch in _chunks:
+        tfidf_dot = sum(w * ch["tfidf"].get(t, 0.0) for t, w in q_tfidf.items())
+        tfidf_cos = tfidf_dot / (q_norm * ch["tfidf_norm"])
+        if q_emb and ch["embedding"]:
+            emb_dot = sum(a * b for a, b in zip(q_emb, ch["embedding"]))
+            emb_cos = emb_dot / (q_emb_norm * ch["embedding_norm"])
+        else:
+            emb_cos = 0.0
+        score = TFIDF_WEIGHT * tfidf_cos + EMBED_WEIGHT * emb_cos
+        if score > 0:
+            scored.append((score, ch))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [
+        {"source": ch["source"], "text": ch["text"], "score": round(score, 4)}
+        for score, ch in scored[:top_k]
+    ]
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = 10
+
+    def _json(self, status, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/health":
+            self._json(200, {"status": "ok", "chunks": len(_chunks)})
+            return
+        if parsed.path == "/retrieve":
+            qs = urllib.parse.parse_qs(parsed.query)
+            query = (qs.get("q") or [""])[0]
+            try:
+                k = int((qs.get("k") or [str(TOP_K)])[0])
+            except ValueError:
+                k = TOP_K
+            if not query.strip():
+                self._json(200, {"results": []})
+                return
+            try:
+                results = retrieve(query, top_k=k)
+            except Exception as exc:
+                log(f"retrieve failed: {exc}")
+                results = []
+            self._json(200, {"results": results})
+            return
+        self._json(404, {"error": "not found"})
+
+    def log_message(self, *_args):
+        pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+if __name__ == "__main__":
+    build_index()
+    Server(("127.0.0.1", LISTEN_PORT), Handler).serve_forever()
+OOD_RAG_INDEX_PY_EOF
+chmod 644 "$rag_index_script"
+export rag_index_script
+# <% end %>

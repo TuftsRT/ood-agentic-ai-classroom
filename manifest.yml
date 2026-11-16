@@ -1,0 +1,9 @@
+---
+name: "Agentic AI Classroom Sandbox"
+role: batch_connect
+category: "Interactive Apps"
+subcategory: "AI"
+description: >
+  A single shared, tool-calling-ready LLM server for an entire class. One GPU
+  is split into many concurrent inference slots so every student gets a
+  private API key to the same running model.
