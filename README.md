@@ -1,10 +1,5 @@
 # Agentic AI Classroom Sandbox
 
-> See `INTERNAL_README.md` for a field-by-field walkthrough of the launch
-> form, the student-connection workflow, and a deep dive on the optional
-> reference-documents (RAG) feature -- operational detail for instructors/
-> admins at this site that doesn't fit this template-shaped README.
-
 ## Overview
 
 Agentic AI Classroom Sandbox is an Open OnDemand Batch Connect app that

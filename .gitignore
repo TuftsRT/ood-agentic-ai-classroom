@@ -9,6 +9,13 @@
 # absent config/site.yml is the Tufts default.
 /config/site.yml
 
+# Tufts-site-specific operational notes for faculty/TAs/admins at this
+# install, not meant for the shared public repo.
+/INTERNAL_README.md
+
+# Local development changelog -- not meant for the shared public repo.
+/CHANGELOG.md
+
 .DS_Store
 *.swp
 *~

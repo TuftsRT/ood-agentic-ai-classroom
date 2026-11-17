@@ -86,13 +86,30 @@ their Slurm job as `llm-classroom-sandbox/<course_group>` (see
 `lib/course_storage.rb`'s `job_name_for`, used from `submit.yml.erb`) --
 `<course_group>` is the course's storage directory name (e.g.
 `c27sp1xx0001`), sanitized to `[A-Za-z0-9_-]`. A student's viewer job finds
-the instructor's session with a plain `squeue --name=... --format='%k'`
+the instructor's session with `squeue --name=... --format='%i|%T|%u|%k'`
 (`%k` is the job's Comment field) -- deliberately *not* by reading anything
 under the instructor's own OOD session directory, which is permission-
-restricted to the instructor and unreadable by students. The Faculty
-session publishes its host/port into that Comment field via
-`scontrol update ... Comment=` once its `guardrails_proxy.py` is actually
-listening (see `template/script.sh.erb`).
+restricted to the instructor and unreadable by students. A `squeue` name
+match alone isn't trusted as proof of whose job it is, since submitting a
+job under that same name is not a privileged action -- any course member
+could do it. The viewer only accepts a match whose owner (`%u`) is
+currently a member of `<course_group>admin` (the same admin-group
+membership `before.sh.erb` already re-validates before honoring
+`course_group` at all), so a classmate can't spoof another student's
+connection page by racing a look-alike job into `squeue` first (see
+`template/script.sh.erb`).
+
+The Faculty session publishes its host/port into that Comment field via
+`scontrol update ... Comment=` right after starting `guardrails_proxy.py`
+in the background -- not after confirming it's actually listening; unlike
+SearXNG and the RAG embed/index servers elsewhere in the same script, there
+is no readiness poll on `guardrails_proxy.py` before that `scontrol update`
+call, so there's a short, unverified window where the published port isn't
+necessarily accepting connections yet. This doesn't expose anything
+prematurely to students, though: the connection page itself (`view.html.erb`)
+separately polls the session's own `/health` endpoint and only reveals the
+"Launch Web UI" button and API keys once that succeeds, regardless of how
+early or late the Comment was published.
 
 **This cross-user `squeue`/Comment visibility has not been verified against
 a real Slurm controller.** It could not be checked from the unprivileged
