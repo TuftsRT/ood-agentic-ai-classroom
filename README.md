@@ -1,8 +1,8 @@
-# Agentic AI Classroom Sandbox
+# Agentic AI with Llama Server (Classroom)
 
 ## Overview
 
-Agentic AI Classroom Sandbox is an Open OnDemand Batch Connect app that
+Agentic AI with Llama Server (Classroom) is an Open OnDemand Batch Connect app that
 launches [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`
 as one shared, tool-calling-capable LLM session for an entire class. It is
 designed for instructors who want every student in a session talking to the
