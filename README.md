@@ -279,12 +279,6 @@ To verify your installation:
   expansion test inputs) have been verified in isolation, not as a running
   session.
 
-## Contributing
-
-This is an internal sandbox app with no public repository yet. Track
-issues and planned work alongside this app's source, and coordinate with
-whoever maintains `lib/class_tiers.rb`'s model/container catalog before
-changing it.
 
 ## References
 
@@ -301,8 +295,7 @@ changing it.
 ### Software Installation
 
 `llama-server` and SearXNG run from this site's existing, shared container
-images (`/cluster/tufts/apps/container/ai/images`,
-`/cluster/tufts/ngc/images`) -- nothing is built or vendored by this app
+images -- nothing is built or vendored by this app
 for those. The one exception is the embedding model for the optional
 reference-documents feature, which this app fetches and owns its own copy
 of:
@@ -310,7 +303,6 @@ of:
 ```bash
 ./download-embedding-model.sh
 ```
-
 Run on a **login node** (needs internet); downloads `nomic-embed-text-v1.5`
 (GGUF, Apache-2.0, ~140MB) into this app's own `models/` folder -- the same
 model and pattern the sibling `rag-sandbox` app already uses.
@@ -321,5 +313,5 @@ model and pattern the sibling `rag-sandbox` app already uses.
 
 ## Acknowledgments
 
-Deployed on Tufts University's HPC cluster (Pax), operated by Tufts
+Deployed on Tufts University's HPC cluster, operated by Tufts
 Technology Services Research Technology.
